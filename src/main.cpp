@@ -458,6 +458,14 @@ void box2d_finish_task(void *userTask, void *userContext) noexcept
 
 SDL_AppResult SDL_AppInit(void **appstate, std::int32_t argc, char *argv[])
 {
+    // Box2D is compiled with AVX2; bail early on unsupported CPUs.
+    if (!SDL_HasAVX2())
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "phys", "This application requires a CPU with AVX2 support.", nullptr);
+
+        return SDL_APP_FAILURE;
+    }
+
     // Set up window and renderer.
     if (!SDL_Init(SDL_INIT_VIDEO))
     {

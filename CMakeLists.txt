@@ -130,9 +130,19 @@ if (PHYS_IS_CLANG)
 elseif (PHYS_IS_MSVC)
     target_compile_options(phys
         PRIVATE
-        /W4)
+        /W4
+        /wd4100  # -Wno-unused-parameter
+        /wd4189  # -Werror=unused-variable (local variable initialized but not referenced)
+        /we4189
+        /wd5205  # -Wno-non-virtual-dtor
+        /wd4191  # -Wno-cast-function-type
+        /permissive-) # -pedantic
 
-    # TODO: Debug/Release flags.
+    target_compile_options(phys PRIVATE $<$<CONFIG:Debug>:/Od /Zi>)
+    target_compile_options(phys PRIVATE $<$<CONFIG:Release>:/O2 /GL /Gy>)
+    target_compile_options(phys PRIVATE $<$<CONFIG:RelWithDebInfo>:/O2 /Zi>)
+
+    target_link_options(phys PRIVATE $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
 endif ()
 
 target_link_libraries(phys PRIVATE dp::thread-pool SDL3::SDL3-static imgui::imgui box2d::box2d $<$<BOOL:${PHYS_IS_WINDOWS}>:dwmapi>)
