@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="32" fill="#1a1a1a"/>
+
+  <!-- Title -->
+  <text x="128" y="62" text-anchor="middle" font-family="sans-serif" font-weight="bold"
+        font-size="40" fill="#ddd" letter-spacing="2">phys</text>
+
+  <!-- Ground line -->
+  <rect x="40" y="208" width="176" height="8" rx="4" fill="#888"/>
+
+  <!-- Box (left, tilted outward) -->
+  <rect x="-20" y="-20" width="40" height="40" rx="4" fill="#3399e6"
+        transform="translate(72 162) rotate(-12)"/>
+
+  <!-- Circle (center, raised) -->
+  <circle cx="128" cy="124" r="26" fill="#e69933"/>
+
+  <!-- Triangle (right, tilted outward) -->
+  <polygon points="0,-30 26,20 -26,20" fill="#33cc55"
+           transform="translate(180 156) rotate(12)"/>
+</svg>

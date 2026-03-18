@@ -1,0 +1,5 @@
+// Icon (ID 1 = default application icon).
+1 ICON "phys.ico"
+
+// Manifest (ID 1 = application manifest).
+1 24 "phys.manifest"

@@ -13,9 +13,25 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            name: Windows
+            name: Windows x64 (AVX2)
+            avx2: 'ON'
+            artifact: phys-windows-x64-avx2
+          - os: windows-latest
+            name: Windows x64
+            avx2: 'OFF'
+            artifact: phys-windows-x64
           - os: ubuntu-latest
-            name: Linux
+            name: Linux x64 (AVX2)
+            avx2: 'ON'
+            artifact: phys-linux-x64-avx2
+          - os: ubuntu-latest
+            name: Linux x64
+            avx2: 'OFF'
+            artifact: phys-linux-x64
+          - os: macos-latest
+            name: macOS ARM64
+            avx2: 'OFF'
+            artifact: phys-macos-arm64
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -24,7 +40,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Windows: MSVC + Ninja (both pre-installed on windows-2025).
+      # Windows: MSVC + Ninja (both pre-installed on windows-latest).
       - name: Setup MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -33,18 +49,7 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        run: cmake --build build
-
-      - name: Upload artifact (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: phys-windows-x64
-          path: build/phys.exe
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHYS_AVX2=${{ matrix.avx2 }}
 
       # Linux: Clang 20 + Ninja.
       - name: Install Clang 20 and dependencies
@@ -63,15 +68,52 @@ jobs:
           cmake -B build -G Ninja \
             -DCMAKE_C_COMPILER=clang-20 \
             -DCMAKE_CXX_COMPILER=clang++-20 \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPHYS_AVX2=${{ matrix.avx2 }}
 
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
+      # macOS: AppleClang + Ninja.
+      - name: Install Ninja
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHYS_AVX2=${{ matrix.avx2 }}
+
+      - name: Build
         run: cmake --build build
+
+      # Linux: Package as AppImage.
+      - name: Package AppImage
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/scalable/apps
+          cp build/phys AppDir/usr/bin/
+          cp deploy/linux/phys.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          cp deploy/linux/phys.desktop AppDir/
+
+          ARCH=x86_64 ./appimagetool AppDir phys.AppImage
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/phys.exe
 
       - name: Upload artifact (Linux)
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: phys-linux-x64
+          name: ${{ matrix.artifact }}
+          path: phys.AppImage
+
+      - name: Upload artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
           path: build/phys

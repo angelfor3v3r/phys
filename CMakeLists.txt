@@ -6,21 +6,32 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set(PHYS_IS_WINDOWS ON)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(PHYS_IS_LINUX ON)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(PHYS_IS_MACOS ON)
 else ()
-    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported operating system. Only Windows and Linux are supported.")
+    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported operating system.")
 endif ()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
     set(PHYS_IS_CLANG ON)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    set(PHYS_IS_CLANG ON)
 elseif (PHYS_IS_WINDOWS AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(PHYS_IS_MSVC ON)
 else ()
-    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only Clang and MSVC are supported.")
+    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only Clang, AppleClang, and MSVC are supported.")
 endif ()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(BUILD_SHARED_LIBS OFF)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
+
+# AVX2 is only available on x86_64.
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    option(PHYS_AVX2 "Enable AVX2 for Box2D SIMD" ON)
+else ()
+    set(PHYS_AVX2 OFF)
+endif ()
 
 if (PHYS_IS_WINDOWS)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -63,7 +74,7 @@ CPMAddPackage(URI "gh:libsdl-org/SDL#release-3.4.2"
     "SDL_OPENGLES OFF"
     "SDL_RENDER_GPU OFF")
 CPMAddPackage("gh:ocornut/imgui@1.92.6-docking")
-CPMAddPackage(URI "gh:erincatto/box2d@3.1.1" OPTIONS "BOX2D_AVX2 ON")
+CPMAddPackage(URI "gh:erincatto/box2d@3.1.1" OPTIONS "BOX2D_AVX2 ${PHYS_AVX2}")
 
 if (imgui_ADDED)
     file(GLOB IMGUI_HEADERS
@@ -95,13 +106,24 @@ endif ()
 
 # set(PHYS_HEADERS ...)
 set(PHYS_SOURCES src/main.cpp)
-# set(PHYS_RESOURCES ...)
+
+if (PHYS_IS_WINDOWS)
+    set(PHYS_RESOURCES deploy/windows/phys.rc)
+endif ()
+
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${PHYS_SOURCES})
-add_executable(phys WIN32 ${PHYS_SOURCES})
+
+if (PHYS_IS_WINDOWS)
+    add_executable(phys WIN32 ${PHYS_SOURCES} ${PHYS_RESOURCES})
+else ()
+    add_executable(phys ${PHYS_SOURCES})
+endif ()
+
 target_compile_features(phys PRIVATE cxx_std_23)
 target_compile_definitions(phys PRIVATE
     $<IF:$<CONFIG:Debug>,PHYS_DEBUG=1,PHYS_DEBUG=0>
     $<$<BOOL:${PHYS_IS_WINDOWS}>:NOMINMAX UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00>
+    PHYS_AVX2=$<BOOL:${PHYS_AVX2}>
     SDL_MAIN_USE_CALLBACKS)
 target_include_directories(phys PRIVATE src)
 
@@ -114,30 +136,24 @@ if (PHYS_IS_CLANG)
         -pedantic
         -Werror=unused-variable
         -Wno-non-virtual-dtor
-        -Wno-unused-parameter
-        -Wno-unused-private-field
-        -Wno-cast-function-type
-        -Wno-missing-designated-field-initializers
-        -Wno-language-extension-token)
-
+        -Wno-unused-private-field)
     target_compile_options(phys PRIVATE $<$<CONFIG:Debug>:-g3 -O0>)
     target_compile_options(phys PRIVATE $<$<CONFIG:Release>:-fno-ident -g0 -O3>)
     target_compile_options(phys PRIVATE $<$<CONFIG:RelWithDebInfo>:-g3 -O3>)
 
-    if (PHYS_IS_LINUX)
+    if (PHYS_IS_WINDOWS)
+        # Clang auto-embeds a manifest via /MANIFEST:EMBED which conflicts with our .rc manifest.
+        string(REPLACE " -Xlinker /MANIFEST:EMBED" "" CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE}")
+    elseif (PHYS_IS_LINUX)
         target_link_options(phys PRIVATE -static-libgcc -static-libstdc++)
     endif ()
 elseif (PHYS_IS_MSVC)
     target_compile_options(phys
         PRIVATE
         /W4
-        /wd4100  # -Wno-unused-parameter
-        /wd4189  # -Werror=unused-variable (local variable initialized but not referenced)
-        /we4189
-        /wd5205  # -Wno-non-virtual-dtor
-        /wd4191  # -Wno-cast-function-type
-        /permissive-) # -pedantic
-
+        /permissive-  # Strict conformance (-pedantic).
+        /we4189       # Error on unused initialized local (-Werror=unused-variable).
+        /wd5205)      # Delete of abstract class with non-virtual dtor (-Wno-non-virtual-dtor).
     target_compile_options(phys PRIVATE $<$<CONFIG:Debug>:/Od /Zi>)
     target_compile_options(phys PRIVATE $<$<CONFIG:Release>:/O2 /GL /Gy>)
     target_compile_options(phys PRIVATE $<$<CONFIG:RelWithDebInfo>:/O2 /Zi>)

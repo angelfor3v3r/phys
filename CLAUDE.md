@@ -5,11 +5,17 @@
 ## Build
 
 ```bash
-# Clang (primary) or MSVC. CMake 3.28+.
+# Clang, AppleClang, or MSVC. CMake 3.28+.
 cmake -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build cmake-build-debug
 # Release
 cmake -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-release
+```
+
+```bash
+# Non-AVX2 build (e.g. ARM or older x86):
+cmake -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHYS_AVX2=OFF
 cmake --build cmake-build-release
 ```
 
@@ -18,10 +24,12 @@ Dependencies are fetched automatically via CPM (no manual installs).
 ## Project layout
 
 ```
-src/main.cpp       -- Entire application (single TU)
-src/imconfig.hpp   -- Dear ImGui compile-time config (custom, not upstream)
-third_party/cmake/ -- get_cpm.cmake (CPM bootstrap)
-.clang-format      -- clang-format 20 config
+src/main.cpp          -- Entire application (single TU)
+src/imconfig.hpp      -- Dear ImGui compile-time config (custom, not upstream)
+deploy/windows/       -- phys.ico, phys.manifest, phys.rc (icon + manifest resource)
+deploy/linux/         -- phys.desktop, phys.svg (AppImage assets)
+third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
+.clang-format         -- clang-format 20 config
 ```
 
 ## Stack
@@ -30,7 +38,7 @@ third_party/cmake/ -- get_cpm.cmake (CPM bootstrap)
 |---------|---------|------|
 | SDL3 | 3.4.2 | Window, input, SDL_Renderer |
 | Dear ImGui | 1.92.6-docking | UI, draw lists (all rendering goes through ImGui) |
-| Box2D | 3.1.1 | Rigid body physics (v3 C API, AVX2 enabled) |
+| Box2D | 3.1.1 | Rigid body physics (v3 C API, AVX2 optional via PHYS_AVX2) |
 | FreeType | 2.14.1 | Font rasterization for ImGui |
 | dp::thread-pool | 0.7.0 | Worker threads shared with Box2D task system |
 
@@ -62,15 +70,23 @@ third_party/cmake/ -- get_cpm.cmake (CPM bootstrap)
 | `g_drawn_lines` | `vector<DrawnLine>` — user-drawn static line geometry |
 | `g_emitters` | `vector<Emitter>` — particle emitters |
 | `g_cam_center`, `g_cam_zoom` | Camera state |
+| `g_ropes` | `vector<Rope>` — chain links between bodies |
+| `g_pins` | `vector<Pin>` — revolute-joint pins to ground |
+| `g_rope_start_body` | Pending rope endpoint (null when idle) |
 | `g_thread_pool` | Shared worker pool |
 | `g_window`, `g_renderer` | SDL window and renderer |
 
 ## Platform notes
 
-- Windows and Linux only. Clang or MSVC.
+- Windows, Linux, and macOS. Clang, AppleClang, or MSVC.
+- AVX2 is a CMake option (`PHYS_AVX2`): ON by default for x86_64, OFF for ARM. Non-AVX2 builds use scalar fallbacks.
 - Windows: hooks `WndProc` for `DwmFlush()` on `WM_MOVING` (drag stutter fix), links `dwmapi`.
 - Static MSVC runtime on Windows (`/MT` / `/MTd`).
-- `WIN32` subsystem (no console window).
+- `WIN32` subsystem on Windows (no console window).
+- Windows icon, manifest (DPI + UTF-8 + common controls v6), and RC resource in `deploy/windows/`.
+- Clang-on-Windows: `/MANIFEST:EMBED` stripped from link command to avoid conflict with RC-embedded manifest.
+- Renderer preference: D3D12 > D3D11 > Metal > Vulkan > OpenGL > software.
+- Camera pixel-snapped via `std::round()` to avoid subpixel blurriness.
 
 ## Conventions
 
@@ -78,3 +94,8 @@ third_party/cmake/ -- get_cpm.cmake (CPM bootstrap)
 - Body creation always appends to `g_bodies` with a `BodyState` for interpolation.
 - All coordinate transforms go through `screen_to_world()` or the `to_screen` lambda in the render block.
 - Out-of-bounds body cleanup happens every frame at the top of `SDL_AppIterate`.
+
+- Rope cleanup: prune invalid joints each frame, destroy orphaned segment bodies.
+- Pin cleanup: prune invalid joints each frame.
+- All range-for loops use `auto &&`.
+- Use Box2D math builtins (`b2Dot`, `b2Lerp`, `b2NLerp`, `b2Normalize`, etc.) over custom wrappers.

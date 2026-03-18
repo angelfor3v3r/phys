@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=phys
+Exec=phys
+Icon=phys
+Categories=Game;Simulation;
+Comment=2D physics sandbox
