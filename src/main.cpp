@@ -763,7 +763,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         }
 
         ImGui::SeparatorText("Selection");
-        std::int64_t selected_count{};
+        int selected_count{};
         for (auto &&body : g_bodies)
         {
             if (body.selected)
@@ -772,7 +772,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             }
         }
 
-        ImGui::Text("%lld selected", selected_count);
+        ImGui::Text("%d selected", selected_count);
 
         ImGui::BeginDisabled(selected_count == 0);
 
