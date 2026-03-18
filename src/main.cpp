@@ -654,18 +654,18 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
     SDL_GetWindowSize(g_window, &g_window_w, &g_window_h);
 
-    // Clamp camera to playground bounds.
+    // Clamp camera so the viewport never extends past the world boundary.
     auto area_w    = AREA_MAX_X - AREA_MIN_X;
     auto area_h    = AREA_MAX_Y - AREA_MIN_Y;
-    g_cam_zoom_min = std::min((float)g_window_w / area_w, (float)g_window_h / area_h);
+    g_cam_zoom_min = std::max((float)g_window_w / area_w, (float)g_window_h / area_h);
     g_cam_zoom     = std::clamp(g_cam_zoom, g_cam_zoom_min, ZOOM_MAX);
 
     auto half_vw   = (float)g_window_w / 2.0f / g_cam_zoom;
     auto half_vh   = (float)g_window_h / 2.0f / g_cam_zoom;
     auto center_x  = (AREA_MIN_X + AREA_MAX_X) / 2.0f;
     auto center_y  = (AREA_MIN_Y + AREA_MAX_Y) / 2.0f;
-    auto clamp_x   = std::max(0.0f, area_w / 2.0f - half_vw);
-    auto clamp_y   = std::max(0.0f, area_h / 2.0f - half_vh);
+    auto clamp_x   = area_w / 2.0f - half_vw;
+    auto clamp_y   = area_h / 2.0f - half_vh;
     g_cam_center.x = std::clamp(g_cam_center.x, center_x - clamp_x, center_x + clamp_x);
     g_cam_center.y = std::clamp(g_cam_center.y, center_y - clamp_y, center_y + clamp_y);
 
