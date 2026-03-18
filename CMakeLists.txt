@@ -12,14 +12,16 @@ else ()
     message(FATAL_ERROR "${PROJECT_NAME}: Unsupported operating system.")
 endif ()
 
+if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "${PROJECT_NAME}: 64-bit platform required.")
+endif ()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
-    set(PHYS_IS_CLANG ON)
-elseif (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     set(PHYS_IS_CLANG ON)
 elseif (PHYS_IS_WINDOWS AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(PHYS_IS_MSVC ON)
 else ()
-    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only Clang, AppleClang, and MSVC are supported.")
+    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only Clang (GNU frontend) and MSVC are supported.")
 endif ()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -158,7 +160,7 @@ elseif (PHYS_IS_MSVC)
     target_compile_options(phys PRIVATE $<$<CONFIG:Release>:/O2 /GL /Gy>)
     target_compile_options(phys PRIVATE $<$<CONFIG:RelWithDebInfo>:/O2 /Zi>)
 
-    target_link_options(phys PRIVATE $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
+    target_link_options(phys PRIVATE /MANIFEST:NO $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
 endif ()
 
 target_link_libraries(phys PRIVATE dp::thread-pool SDL3::SDL3-static imgui::imgui box2d::box2d $<$<BOOL:${PHYS_IS_WINDOWS}>:dwmapi>)

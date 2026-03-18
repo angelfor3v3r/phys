@@ -5,7 +5,7 @@
 ## Build
 
 ```bash
-# Clang, AppleClang, or MSVC. CMake 3.28+.
+# Clang (GNU frontend) or MSVC. CMake 3.28+.
 cmake -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build cmake-build-debug
 # Release
@@ -78,7 +78,7 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 
 ## Platform notes
 
-- Windows, Linux, and macOS. Clang, AppleClang, or MSVC.
+- Windows, Linux, and macOS. Clang (GNU frontend, LLVM 20) or MSVC. AppleClang is NOT supported (missing `std::jthread`/`std::stop_token`).
 - AVX2 is a CMake option (`PHYS_AVX2`): ON by default for x86_64, OFF for ARM. Non-AVX2 builds use scalar fallbacks.
 - Windows: hooks `WndProc` for `DwmFlush()` on `WM_MOVING` (drag stutter fix), links `dwmapi`.
 - Static MSVC runtime on Windows (`/MT` / `/MTd`).
@@ -92,10 +92,15 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 
 - When adding a new shape type, update: `SpawnShape` enum, `add_*()` function, `tick_emitters` switch, drag-drop preview switch, drag-drop spawn switch, and rendering in `SDL_AppIterate`.
 - Body creation always appends to `g_bodies` with a `BodyState` for interpolation.
+- Body deletion goes through `delete_selected()` — both the ImGui button and Delete key call it.
 - All coordinate transforms go through `screen_to_world()` or the `to_screen` lambda in the render block.
 - Out-of-bounds body cleanup happens every frame at the top of `SDL_AppIterate`.
 
-- Rope cleanup: prune invalid joints each frame, destroy orphaned segment bodies.
+- Rope cleanup: prune ropes with dead anchors each frame, destroy orphaned segment bodies + joints.
+- Rope cutting (Shift+Right drag): destroys all joints, splits segments into two half-ropes re-wired at current separations. `wire_half` guards null anchors (dangling ends get no anchor joint or filter joints).
+- Rope erasing (Ctrl+Right drag): hit-tests cursor against rope links, destroys entire rope (all joints + segment bodies).
 - Pin cleanup: prune invalid joints each frame.
+- Pin/unpin actions set `g_just_pinned` to suppress right-click-up selection toggle.
 - All range-for loops use `auto &&`.
 - Use Box2D math builtins (`b2Dot`, `b2Lerp`, `b2NLerp`, `b2Normalize`, etc.) over custom wrappers.
+- Variable naming: `dist_def`, `rev_def`, `mouse_def`, `filter_def_a/b` for joint defs. No single-letter names except standard math (`t`, `r`, `d`).

@@ -17,6 +17,7 @@
 #include <memory>
 #include <new>
 #include <numbers>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -124,8 +125,12 @@ std::vector<Emitter> g_emitters{};
 // Ropes: Chain of small circle bodies connected by revolute joints.
 struct Rope
 {
-    std::vector<b2BodyId>  segments{}; // Intermediate chain links.
-    std::vector<b2JointId> joints{};   // All joints (anchor-to-segment, segment-to-segment).
+    std::vector<b2BodyId>  segments{};             // Intermediate chain links.
+    std::vector<b2JointId> joints{};               // All joints (distance + filter).
+    b2BodyId               body_a = b2_nullBodyId; // Anchor body at start (null if dangling).
+    b2BodyId               body_b = b2_nullBodyId; // Anchor body at end   (null if dangling).
+    b2Vec2                 local_a{};              // Attach point in body_a's local space.
+    b2Vec2                 local_b{};              // Attach point in body_b's local space.
 };
 
 std::vector<Rope> g_ropes{};
@@ -141,13 +146,14 @@ struct Pin
 std::vector<Pin> g_pins{};
 
 // Interaction.
-b2JointId    g_mouse_joint = b2_nullJointId;
-b2BodyId     g_mouse_body  = b2_nullBodyId;
-bool         g_box_selecting{};
-ImVec2       g_box_select_start{};
-std::int32_t g_dragged_emitter = -1;
-bool         g_erasing{};
-bool         g_just_pinned{};
+b2JointId                  g_mouse_joint = b2_nullJointId;
+b2BodyId                   g_mouse_body  = b2_nullBodyId;
+bool                       g_box_selecting{};
+ImVec2                     g_box_select_start{};
+std::optional<std::size_t> g_dragged_emitter{};
+bool                       g_erasing{};
+bool                       g_cutting{};
+bool                       g_just_pinned{};
 
 struct TaskHandle
 {
@@ -307,9 +313,9 @@ void add_triangle(b2Vec2 position, float height)
     auto shape_def              = b2DefaultShapeDef();
     shape_def.material.friction = 0.5f;
 
-    for (std::size_t i = 1; i < points.size(); ++i)
+    for (std::size_t i{}; i < points.size() - 1; ++i)
     {
-        b2Segment segment{points[i - 1], points[i]};
+        b2Segment segment{points[i], points[i + 1]};
         b2CreateSegmentShape(body, &shape_def, &segment);
     }
 
@@ -328,6 +334,19 @@ void finish_stroke()
     g_drawn_lines.emplace_back(create_drawn_line(std::move(g_current_stroke)));
 
     g_current_stroke.clear();
+}
+
+void delete_selected()
+{
+    for (auto &&body : g_bodies)
+    {
+        if (body.selected)
+        {
+            b2DestroyBody(body.body);
+        }
+    }
+
+    std::erase_if(g_bodies, [](const PhysBody &body) { return body.selected; });
 }
 
 void tick_emitters(float dt)
@@ -756,18 +775,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         ImGui::Text("%lld selected", selected_count);
 
         ImGui::BeginDisabled(selected_count == 0);
+
         if (ImGui::Button("Delete Selected"))
         {
-            for (auto &&body : g_bodies)
-            {
-                if (body.selected)
-                {
-                    b2DestroyBody(body.body);
-                }
-            }
-
-            std::erase_if(g_bodies, [](const PhysBody &body) { return body.selected; });
+            delete_selected();
         }
+
         ImGui::EndDisabled();
 
         ImGui::SeparatorText("Emitters");
@@ -862,12 +875,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             hint("Left-click drag", "Move body");
             hint("Right-click while dragging", "Pin body at position");
+            hint("Ctrl+Right-click on pin", "Unpin body");
             hint("Ctrl+Left drag", "Draw line");
-            hint("Ctrl+Right drag", "Erase lines");
-            hint("Right-click", "Select/deselect body");
-            hint("Right-click drag", "Box select");
-            hint("Shift+Right drag", "Add to selection");
+            hint("Ctrl+Right drag", "Erase lines / ropes");
             hint("Shift+Left-click", "Link rope (2 bodies)");
+            hint("Shift+Right drag", "Cut ropes");
+            hint("Right-click drag", "Box select");
             hint("Delete / Backspace", "Delete selected");
             hint("Escape", "Clear selection / cancel");
             hint("Middle-click drag", "Pan camera");
@@ -971,7 +984,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
     // Render physics bodies to background draw list.
     {
-        // Camera transform — snap to pixel grid to avoid subpixel blurriness.
+        // Camera transform - snap to pixel grid to avoid subpixel blurriness.
         auto cam_x = std::round((float)g_window_w / 2.0f - g_cam_center.x * g_cam_zoom);
         auto cam_y = std::round((float)g_window_h / 2.0f + g_cam_center.y * g_cam_zoom);
 
@@ -1010,17 +1023,17 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 }
             }
 
-            auto draw_filled = [bg](ImVec2 *verts, std::int32_t count, ImU32 c)
+            auto draw_filled = [bg](ImVec2 *verts, std::int32_t count, ImU32 color) noexcept
             {
                 if (count == 4)
                 {
-                    bg->AddQuadFilled(verts[0], verts[1], verts[2], verts[3], c);
+                    bg->AddQuadFilled(verts[0], verts[1], verts[2], verts[3], color);
                 }
                 else if (count >= 3)
                 {
                     for (std::int32_t j = 1; j < count - 1; ++j)
                     {
-                        bg->AddTriangleFilled(verts[0], verts[j], verts[j + 1], c);
+                        bg->AddTriangleFilled(verts[0], verts[j], verts[j + 1], color);
                     }
                 }
             };
@@ -1041,7 +1054,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         auto outline_enabled = g_cam_zoom >= 15.0f;
 
         // Helper: Get the single polygon shape from a body.
-        auto get_poly = [](b2BodyId body)
+        auto get_poly = [](b2BodyId body) noexcept
         {
             b2ShapeId shape;
             b2Body_GetShapes(body, &shape, 1);
@@ -1053,14 +1066,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         render_poly(b2Body_GetPosition(g_ground_id), b2Body_GetRotation(g_ground_id), get_poly(g_ground_id), IM_COL32(102, 102, 102, 255));
 
         // Compute live box-select AABB for hover highlighting.
-        b2AABB select_aabb{};
-        bool   has_select_aabb{}; // TODO: Silly, replace with optional.
+        std::optional<b2AABB> select_aabb{};
         if (g_box_selecting)
         {
-            auto w0         = screen_to_world(g_box_select_start.x, g_box_select_start.y);
-            auto w1         = screen_to_world(mouse_pos.x, mouse_pos.y);
-            select_aabb     = {b2Min(w0, w1), b2Max(w0, w1)};
-            has_select_aabb = true;
+            auto world_corner_a = screen_to_world(g_box_select_start.x, g_box_select_start.y);
+            auto world_corner_b = screen_to_world(mouse_pos.x, mouse_pos.y);
+            select_aabb         = b2AABB{b2Min(world_corner_a, world_corner_b), b2Max(world_corner_a, world_corner_b)};
         }
 
         // Viewport culling AABB in world space.
@@ -1110,7 +1121,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             // Compute selection state from shape AABB vs selection AABB.
             auto is_selected = body.selected;
-            if (!is_selected && has_select_aabb)
+            if (!is_selected && select_aabb)
             {
                 b2AABB body_aabb{};
                 if (type == b2_polygonShape)
@@ -1135,10 +1146,10 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     body_aabb   = {{center.x - circle.radius, center.y - circle.radius}, {center.x + circle.radius, center.y + circle.radius}};
                 }
 
-                is_selected = body_aabb.lowerBound.x <= select_aabb.upperBound.x
-                           && body_aabb.upperBound.x >= select_aabb.lowerBound.x
-                           && body_aabb.lowerBound.y <= select_aabb.upperBound.y
-                           && body_aabb.upperBound.y >= select_aabb.lowerBound.y;
+                is_selected = body_aabb.lowerBound.x <= select_aabb->upperBound.x
+                           && body_aabb.upperBound.x >= select_aabb->lowerBound.x
+                           && body_aabb.lowerBound.y <= select_aabb->upperBound.y
+                           && body_aabb.upperBound.y >= select_aabb->lowerBound.y;
             }
 
             auto fill_color = is_selected ? IM_COL32(230, 50, 50, 255) : ImU32{};
@@ -1231,62 +1242,75 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             constexpr auto ROPE_OUTLINE   = IM_COL32(120, 90, 60, 255);
             auto           rope_thickness = std::max(2.0f, 4.0f * g_cam_zoom / ZOOM_DEFAULT);
 
-            // Prune broken ropes (anchor body was destroyed, which cascades joint destruction).
+            // Prune ropes whose anchor body was destroyed.
             std::erase_if(
                 g_ropes,
                 [](const Rope &rope)
                 {
-                    if (rope.joints.empty() || !b2Joint_IsValid(rope.joints.front()) || !b2Joint_IsValid(rope.joints.back()))
+                    auto a_dead = B2_IS_NON_NULL(rope.body_a) && !b2Body_IsValid(rope.body_a);
+                    auto b_dead = B2_IS_NON_NULL(rope.body_b) && !b2Body_IsValid(rope.body_b);
+                    if (!a_dead && !b_dead)
                     {
-                        // Destroy orphaned segment bodies.
-                        for (auto &&segment : rope.segments)
-                        {
-                            if (b2Body_IsValid(segment))
-                            {
-                                b2DestroyBody(segment);
-                            }
-                        }
-
-                        return true;
+                        return false;
                     }
 
-                    return false;
+                    for (auto &&joint : rope.joints)
+                    {
+                        if (b2Joint_IsValid(joint))
+                        {
+                            b2DestroyJoint(joint);
+                        }
+                    }
+
+                    for (auto &&seg : rope.segments)
+                    {
+                        if (b2Body_IsValid(seg))
+                        {
+                            b2DestroyBody(seg);
+                        }
+                    }
+
+                    return true;
                 });
 
             for (auto &&rope : g_ropes)
             {
-                // Collect world positions: anchor A, segments, anchor B.
-                auto first_joint = rope.joints.front();
-                auto last_joint  = rope.joints.back();
-                auto body_a      = b2Joint_GetBodyA(first_joint);
-                auto body_b      = b2Joint_GetBodyB(last_joint);
-                auto world_a     = b2Body_GetWorldPoint(body_a, b2Joint_GetLocalAnchorA(first_joint));
-                auto world_b     = b2Body_GetWorldPoint(body_b, b2Joint_GetLocalAnchorB(last_joint));
-
-                // Build point list for smooth line: anchor A + segment centers + anchor B.
+                // Build point list: Anchor A (if present), segment centers, anchor B (if present).
                 std::vector<b2Vec2> points{};
                 points.reserve(rope.segments.size() + 2);
-                points.emplace_back(world_a);
+
+                if (B2_IS_NON_NULL(rope.body_a))
+                {
+                    points.emplace_back(b2Body_GetWorldPoint(rope.body_a, rope.local_a));
+                }
 
                 for (auto &&segment : rope.segments)
                 {
                     points.emplace_back(b2Body_GetPosition(segment));
                 }
 
-                points.emplace_back(world_b);
+                if (B2_IS_NON_NULL(rope.body_b))
+                {
+                    points.emplace_back(b2Body_GetWorldPoint(rope.body_b, rope.local_b));
+                }
+
+                if (points.size() < 2)
+                {
+                    continue;
+                }
 
                 // Draw outline then fill using the Catmull-Rom path renderer.
-                render_smooth_line(points, ROPE_OUTLINE, rope_thickness + 2.0f);
+                render_smooth_line(points, ROPE_OUTLINE, rope_thickness + std::max(2.0f, 3.0f * std::sqrt(g_cam_zoom / ZOOM_DEFAULT)));
                 render_smooth_line(points, ROPE_COLOR, rope_thickness);
             }
 
             // Pending rope: line from start anchor to cursor.
             if (B2_IS_NON_NULL(g_rope_start_body))
             {
-                auto world_a = b2Body_GetWorldPoint(g_rope_start_body, g_rope_start_anchor);
-                auto sa      = to_screen(world_a);
-                auto cursor  = ImGui::GetMousePos();
-                bg->AddLine(sa, cursor, IM_COL32(194, 154, 108, 128), rope_thickness);
+                auto world_a      = b2Body_GetWorldPoint(g_rope_start_body, g_rope_start_anchor);
+                auto screen_start = to_screen(world_a);
+                auto cursor       = ImGui::GetMousePos();
+                bg->AddLine(screen_start, cursor, IM_COL32(194, 154, 108, 128), rope_thickness);
             }
         }
 
@@ -1294,22 +1318,22 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         {
             std::erase_if(g_pins, [](const Pin &pin) { return !b2Joint_IsValid(pin.joint); });
 
-            auto r     = std::max(5.0f, 8.0f * g_cam_zoom / ZOOM_DEFAULT);
-            auto slot  = r * 0.55f;
-            auto thick = std::max(1.0f, 1.5f * g_cam_zoom / ZOOM_DEFAULT);
-
+            auto zoom_ratio = g_cam_zoom / ZOOM_DEFAULT;
+            auto radius     = std::clamp(8.0f * std::sqrt(zoom_ratio), 4.0f, 20.0f);
+            auto slot       = radius * 0.55f;
+            auto thickness  = std::clamp(1.5f * std::sqrt(zoom_ratio), 1.0f, 4.0f);
             for (auto &&pin : g_pins)
             {
-                auto world_pos = b2Body_GetWorldPoint(pin.body, b2Vec2_zero);
-                auto sp        = to_screen(world_pos);
+                auto world_pos  = b2Body_GetWorldPoint(pin.body, b2Vec2_zero);
+                auto screen_pos = to_screen(world_pos);
 
                 // Head.
-                bg->AddCircleFilled(sp, r, IM_COL32(140, 140, 140, 255));
-                bg->AddCircle(sp, r, IM_COL32(90, 90, 90, 255), 0, thick);
+                bg->AddCircleFilled(screen_pos, radius, IM_COL32(140, 140, 140, 255));
+                bg->AddCircle(screen_pos, radius, IM_COL32(90, 90, 90, 255), 0, thickness);
 
                 // Phillips cross.
-                bg->AddLine({sp.x - slot, sp.y}, {sp.x + slot, sp.y}, IM_COL32(60, 60, 60, 200), thick);
-                bg->AddLine({sp.x, sp.y - slot}, {sp.x, sp.y + slot}, IM_COL32(60, 60, 60, 200), thick);
+                bg->AddLine({screen_pos.x - slot, screen_pos.y}, {screen_pos.x + slot, screen_pos.y}, IM_COL32(60, 60, 60, 200), thickness);
+                bg->AddLine({screen_pos.x, screen_pos.y - slot}, {screen_pos.x, screen_pos.y + slot}, IM_COL32(60, 60, 60, 200), thickness);
             }
         }
 
@@ -1414,9 +1438,11 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                             auto seg_count = std::max(2, (std::int32_t)(dist / SEG_SPACING));
 
                             // Create segment bodies along the line.
-                            auto body_def         = b2DefaultBodyDef();
-                            body_def.type         = b2_dynamicBody;
-                            body_def.gravityScale = 1.0f;
+                            auto body_def           = b2DefaultBodyDef();
+                            body_def.type           = b2_dynamicBody;
+                            body_def.gravityScale   = 1.0f;
+                            body_def.linearDamping  = 0.5f;
+                            body_def.angularDamping = 2.0f;
 
                             auto shape_def              = b2DefaultShapeDef();
                             shape_def.density           = 0.5f;
@@ -1441,65 +1467,70 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
                             // Connect anchor A -> first segment.
                             {
-                                auto jd         = b2DefaultDistanceJointDef();
-                                jd.bodyIdA      = g_rope_start_body;
-                                jd.bodyIdB      = rope.segments.front();
-                                jd.localAnchorA = g_rope_start_anchor;
-                                jd.localAnchorB = b2Vec2_zero;
-                                jd.length       = link_len;
-                                jd.enableLimit  = true;
-                                jd.minLength    = link_len * 0.05f;
-                                jd.maxLength    = link_len;
+                                auto dist_def         = b2DefaultDistanceJointDef();
+                                dist_def.bodyIdA      = g_rope_start_body;
+                                dist_def.bodyIdB      = rope.segments.front();
+                                dist_def.localAnchorA = g_rope_start_anchor;
+                                dist_def.localAnchorB = b2Vec2_zero;
+                                dist_def.length       = link_len;
+                                dist_def.enableLimit  = true;
+                                dist_def.minLength    = link_len * 0.05f;
+                                dist_def.maxLength    = link_len;
 
-                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &jd));
+                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &dist_def));
                             }
 
                             // Connect segments to each other.
                             for (std::int32_t i{}; i < seg_count - 1; ++i)
                             {
-                                auto jd         = b2DefaultDistanceJointDef();
-                                jd.bodyIdA      = rope.segments[i];
-                                jd.bodyIdB      = rope.segments[i + 1];
-                                jd.localAnchorA = b2Vec2_zero;
-                                jd.localAnchorB = b2Vec2_zero;
-                                jd.length       = link_len;
-                                jd.enableLimit  = true;
-                                jd.minLength    = link_len * 0.05f;
-                                jd.maxLength    = link_len;
+                                auto dist_def         = b2DefaultDistanceJointDef();
+                                dist_def.bodyIdA      = rope.segments[i];
+                                dist_def.bodyIdB      = rope.segments[i + 1];
+                                dist_def.localAnchorA = b2Vec2_zero;
+                                dist_def.localAnchorB = b2Vec2_zero;
+                                dist_def.length       = link_len;
+                                dist_def.enableLimit  = true;
+                                dist_def.minLength    = link_len * 0.05f;
+                                dist_def.maxLength    = link_len;
 
-                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &jd));
+                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &dist_def));
                             }
 
                             // Connect last segment -> anchor B.
                             {
-                                auto jd         = b2DefaultDistanceJointDef();
-                                jd.bodyIdA      = rope.segments.back();
-                                jd.bodyIdB      = hit;
-                                jd.localAnchorA = b2Vec2_zero;
-                                jd.localAnchorB = anchor_b;
-                                jd.length       = link_len;
-                                jd.enableLimit  = true;
-                                jd.minLength    = link_len * 0.05f;
-                                jd.maxLength    = link_len;
+                                auto dist_def         = b2DefaultDistanceJointDef();
+                                dist_def.bodyIdA      = rope.segments.back();
+                                dist_def.bodyIdB      = hit;
+                                dist_def.localAnchorA = b2Vec2_zero;
+                                dist_def.localAnchorB = anchor_b;
+                                dist_def.length       = link_len;
+                                dist_def.enableLimit  = true;
+                                dist_def.minLength    = link_len * 0.05f;
+                                dist_def.maxLength    = link_len;
 
-                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &jd));
+                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &dist_def));
                             }
 
                             // Disable collision between rope segments and their anchor bodies.
                             for (auto &&seg : rope.segments)
                             {
-                                auto fa    = b2DefaultFilterJointDef();
-                                fa.bodyIdA = g_rope_start_body;
-                                fa.bodyIdB = seg;
+                                auto filter_def_a    = b2DefaultFilterJointDef();
+                                filter_def_a.bodyIdA = g_rope_start_body;
+                                filter_def_a.bodyIdB = seg;
 
-                                rope.joints.emplace_back(b2CreateFilterJoint(g_world, &fa));
+                                rope.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_a));
 
-                                auto fb    = b2DefaultFilterJointDef();
-                                fb.bodyIdA = hit;
-                                fb.bodyIdB = seg;
+                                auto filter_def_b    = b2DefaultFilterJointDef();
+                                filter_def_b.bodyIdA = hit;
+                                filter_def_b.bodyIdB = seg;
 
-                                rope.joints.emplace_back(b2CreateFilterJoint(g_world, &fb));
+                                rope.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_b));
                             }
+
+                            rope.body_a  = g_rope_start_body;
+                            rope.body_b  = hit;
+                            rope.local_a = g_rope_start_anchor;
+                            rope.local_b = anchor_b;
 
                             g_ropes.emplace_back(std::move(rope));
                         }
@@ -1529,29 +1560,29 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 {
                     if (b2LengthSquared(world_point - g_emitters[i].position) <= EMITTER_GRAB_RADIUS * EMITTER_GRAB_RADIUS)
                     {
-                        g_dragged_emitter = i; // TODO: Silly, replace with optional?
+                        g_dragged_emitter = i;
 
                         break;
                     }
                 }
 
                 // If no emitter hit, try grabbing a body.
-                if (g_dragged_emitter < 0)
+                if (!g_dragged_emitter)
                 {
                     g_mouse_body = find_body_at(world_point);
                     if (B2_IS_NON_NULL(g_mouse_body))
                     {
                         b2Body_SetAwake(g_mouse_body, true);
 
-                        auto def         = b2DefaultMouseJointDef();
-                        def.bodyIdA      = g_ground_id;
-                        def.bodyIdB      = g_mouse_body;
-                        def.target       = world_point;
-                        def.maxForce     = 10000.0f * b2Body_GetMass(g_mouse_body);
-                        def.hertz        = 60.0f;
-                        def.dampingRatio = 1.0f;
+                        auto mouse_def         = b2DefaultMouseJointDef();
+                        mouse_def.bodyIdA      = g_ground_id;
+                        mouse_def.bodyIdB      = g_mouse_body;
+                        mouse_def.target       = world_point;
+                        mouse_def.maxForce     = 10000.0f * b2Body_GetMass(g_mouse_body);
+                        mouse_def.hertz        = 60.0f;
+                        mouse_def.dampingRatio = 1.0f;
 
-                        g_mouse_joint = b2CreateMouseJoint(g_world, &def);
+                        g_mouse_joint = b2CreateMouseJoint(g_world, &mouse_def);
 
                         b2Body_SetFixedRotation(g_mouse_body, true);
                         b2Body_EnableSleep(g_mouse_body, false);
@@ -1562,19 +1593,17 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
         // Right-click.
         else if (event->button.button == SDL_BUTTON_RIGHT)
         {
-            // Pin body at current position while dragging it.
+            // Right-click while dragging: pin body at current position.
             if (B2_IS_NON_NULL(g_mouse_joint))
             {
-                auto pos        = b2Body_GetPosition(g_mouse_body);
-                auto jd         = b2DefaultRevoluteJointDef();
-                jd.bodyIdA      = g_ground_id;
-                jd.bodyIdB      = g_mouse_body;
-                jd.localAnchorA = b2Body_GetLocalPoint(g_ground_id, pos);
-                jd.localAnchorB = b2Vec2_zero;
+                auto pos             = b2Body_GetPosition(g_mouse_body);
+                auto rev_def         = b2DefaultRevoluteJointDef();
+                rev_def.bodyIdA      = g_ground_id;
+                rev_def.bodyIdB      = g_mouse_body;
+                rev_def.localAnchorA = b2Body_GetLocalPoint(g_ground_id, pos);
+                rev_def.localAnchorB = b2Vec2_zero;
 
-                auto pin_joint = b2CreateRevoluteJoint(g_world, &jd);
-
-                g_pins.emplace_back(pin_joint, g_mouse_body);
+                g_pins.emplace_back(b2CreateRevoluteJoint(g_world, &rev_def), g_mouse_body);
 
                 // Release drag.
                 b2DestroyJoint(g_mouse_joint);
@@ -1585,9 +1614,29 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 g_mouse_body  = b2_nullBodyId;
                 g_just_pinned = true;
             }
+            else if ((SDL_GetModState() & SDL_KMOD_SHIFT) != 0)
+            {
+                g_cutting = true;
+            }
             else if ((SDL_GetModState() & SDL_KMOD_CTRL) != 0)
             {
-                g_erasing = true;
+                // Ctrl+Right-click on a pinned body: unpin it.
+                auto world_point = screen_to_world(event->button.x, event->button.y);
+                auto hit_body    = find_body_at(world_point);
+                auto pin_it = std::find_if(g_pins.begin(), g_pins.end(), [hit_body](const Pin &pin) { return B2_ID_EQUALS(pin.body, hit_body); });
+                if (B2_IS_NON_NULL(hit_body) && pin_it != g_pins.end())
+                {
+                    b2DestroyJoint(pin_it->joint);
+
+                    g_pins.erase(pin_it);
+
+                    g_just_pinned = true; // Suppress right-click-up selection.
+                }
+                else
+                {
+                    // No pin under cursor: start erasing.
+                    g_erasing = true;
+                }
             }
             else
             {
@@ -1613,9 +1662,9 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             {
                 finish_stroke();
             }
-            else if (g_dragged_emitter >= 0)
+            else if (g_dragged_emitter)
             {
-                g_dragged_emitter = -1;
+                g_dragged_emitter.reset();
             }
             else if (B2_IS_NON_NULL(g_mouse_joint))
             {
@@ -1643,6 +1692,11 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             else if (g_erasing)
             {
                 g_erasing = false;
+            }
+            // Shift+Right was rope cut mode - already handled in motion.
+            else if (g_cutting)
+            {
+                g_cutting = false;
             }
             // Click, not drag: Toggle selection on body under cursor.
             else if (drag.x * drag.x + drag.y * drag.y < 25.0f)
@@ -1682,10 +1736,9 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     }
                 }
 
-                auto   w0 = screen_to_world(g_box_select_start.x, g_box_select_start.y);
-                auto   w1 = screen_to_world(g_box_select_start.x + drag.x, g_box_select_start.y + drag.y);
-                b2AABB aabb{b2Min(w0, w1), b2Max(w0, w1)};
-
+                auto                  world_corner_a = screen_to_world(g_box_select_start.x, g_box_select_start.y);
+                auto                  world_corner_b = screen_to_world(g_box_select_start.x + drag.x, g_box_select_start.y + drag.y);
+                b2AABB                aabb{b2Min(world_corner_a, world_corner_b), b2Max(world_corner_a, world_corner_b)};
                 std::vector<b2BodyId> in_box{};
                 b2World_OverlapAABB(
                     g_world, aabb, b2DefaultQueryFilter(),
@@ -1727,10 +1780,10 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             g_cam_center.x -= event->motion.xrel / g_cam_zoom;
             g_cam_center.y += event->motion.yrel / g_cam_zoom;
         }
-        else if (g_dragged_emitter >= 0)
+        else if (g_dragged_emitter)
         {
-            auto world_point                       = screen_to_world(event->motion.x, event->motion.y);
-            g_emitters[g_dragged_emitter].position = world_point;
+            auto world_point                        = screen_to_world(event->motion.x, event->motion.y);
+            g_emitters[*g_dragged_emitter].position = world_point;
         }
         else if (B2_IS_NON_NULL(g_mouse_joint))
         {
@@ -1744,21 +1797,19 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             auto world_point = screen_to_world(event->motion.x, event->motion.y);
             for (std::size_t i{}; i < g_drawn_lines.size(); ++i)
             {
-                auto       &line = g_drawn_lines[i];
-                std::size_t hit_seg{}; // TODO: This is silly. We can use an optional or something.
-                bool        found_hit{};
-                for (std::size_t j = 1; j < line.points.size(); ++j)
+                auto                      &line = g_drawn_lines[i];
+                std::optional<std::size_t> hit_seg{};
+                for (std::size_t j{}; j < line.points.size() - 1; ++j)
                 {
-                    if (segment_distance_squared(world_point, line.points[j - 1], line.points[j]) <= HIT_DIST_SQUARED)
+                    if (segment_distance_squared(world_point, line.points[j], line.points[j + 1]) <= HIT_DIST_SQUARED)
                     {
-                        hit_seg   = j;
-                        found_hit = true;
+                        hit_seg = j + 1;
 
                         break;
                     }
                 }
 
-                if (!found_hit)
+                if (!hit_seg)
                 {
                     continue;
                 }
@@ -1768,8 +1819,8 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
                 // Split into left [0..hit_seg-1] and right [hit_seg..end].
                 auto       &pts = line.points;
-                std::vector left(pts.begin(), pts.begin() + (std::ptrdiff_t)hit_seg);
-                std::vector right(pts.begin() + (std::ptrdiff_t)hit_seg, pts.end());
+                std::vector left(pts.begin(), pts.begin() + (std::ptrdiff_t)*hit_seg);
+                std::vector right(pts.begin() + (std::ptrdiff_t)*hit_seg, pts.end());
 
                 // Remove original line.
                 g_drawn_lines.erase(g_drawn_lines.begin() + (std::ptrdiff_t)i);
@@ -1786,6 +1837,238 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 }
 
                 --i;
+            }
+
+            // Erase ropes: hit-test cursor against rope links, destroy entire rope on hit.
+            for (std::size_t i{}; i < g_ropes.size(); ++i)
+            {
+                auto &&rope = g_ropes[i];
+
+                std::vector<b2Vec2> points{};
+                points.reserve(rope.segments.size() + 2);
+
+                if (B2_IS_NON_NULL(rope.body_a))
+                {
+                    points.emplace_back(b2Body_GetWorldPoint(rope.body_a, rope.local_a));
+                }
+
+                for (auto &&segment : rope.segments)
+                {
+                    points.emplace_back(b2Body_GetPosition(segment));
+                }
+
+                if (B2_IS_NON_NULL(rope.body_b))
+                {
+                    points.emplace_back(b2Body_GetWorldPoint(rope.body_b, rope.local_b));
+                }
+
+                if (points.size() < 2)
+                {
+                    continue;
+                }
+
+                bool hit{};
+                for (std::size_t j{}; j < points.size() - 1; ++j)
+                {
+                    if (segment_distance_squared(world_point, points[j], points[j + 1]) <= HIT_DIST_SQUARED)
+                    {
+                        hit = true;
+
+                        break;
+                    }
+                }
+
+                if (!hit)
+                {
+                    continue;
+                }
+
+                // Destroy all joints and segment bodies.
+                for (auto &&joint : rope.joints)
+                {
+                    if (b2Joint_IsValid(joint))
+                    {
+                        b2DestroyJoint(joint);
+                    }
+                }
+
+                for (auto &&segment : rope.segments)
+                {
+                    if (b2Body_IsValid(segment))
+                    {
+                        b2DestroyBody(segment);
+                    }
+                }
+
+                g_ropes.erase(g_ropes.begin() + (std::ptrdiff_t)i);
+
+                --i;
+            }
+        }
+        else if (g_cutting)
+        {
+            constexpr auto HIT_DIST_SQUARED = 0.15f * 0.15f;
+
+            auto world_point = screen_to_world(event->motion.x, event->motion.y);
+            auto rope_count  = g_ropes.size(); // Snapshot - don't iterate newly appended halves.
+            for (std::size_t i{}; i < rope_count; ++i)
+            {
+                auto &rope      = g_ropes[i];
+                auto  seg_count = (std::int32_t)rope.segments.size();
+                auto  body_a    = rope.body_a;
+                auto  body_b    = rope.body_b;
+                auto  anchor_a  = rope.local_a;
+                auto  anchor_b  = rope.local_b;
+                auto  has_a     = B2_IS_NON_NULL(body_a);
+                auto  has_b     = B2_IS_NON_NULL(body_b);
+
+                // Build point list matching render layout.
+                std::vector<b2Vec2> points{};
+                points.reserve(rope.segments.size() + 2);
+
+                if (has_a)
+                {
+                    points.emplace_back(b2Body_GetWorldPoint(body_a, anchor_a));
+                }
+
+                for (auto &&seg : rope.segments)
+                {
+                    points.emplace_back(b2Body_GetPosition(seg));
+                }
+
+                if (has_b)
+                {
+                    points.emplace_back(b2Body_GetWorldPoint(body_b, anchor_b));
+                }
+
+                if (points.size() < 2)
+                {
+                    continue;
+                }
+
+                // Test cursor against each link.
+                std::optional<std::int32_t> hit_link{};
+                for (std::size_t j{}; j < points.size() - 1; ++j)
+                {
+                    if (segment_distance_squared(world_point, points[j], points[j + 1]) <= HIT_DIST_SQUARED)
+                    {
+                        hit_link = (std::int32_t)j;
+
+                        break;
+                    }
+                }
+
+                if (!hit_link)
+                {
+                    continue;
+                }
+
+                // Destroy all joints.
+                for (auto &&joint : rope.joints)
+                {
+                    if (b2Joint_IsValid(joint))
+                    {
+                        b2DestroyJoint(joint);
+                    }
+                }
+
+                // Map hit_link in points[] to a segment-space cut index.
+                // points: [anchor_a?] [seg_0 .. seg_(N-1)] [anchor_b?]
+                // cut_seg = first segment on the right side of the cut.
+                auto cut_seg     = has_a ? *hit_link : *hit_link + 1;
+                auto left_count  = cut_seg;
+                auto right_count = seg_count - cut_seg;
+
+                // Helper: Create a distance joint at the current separation.
+                auto make_dist = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to)
+                {
+                    auto world_from       = b2Body_GetWorldPoint(body_from, local_from);
+                    auto world_to         = b2Body_GetWorldPoint(body_to, local_to);
+                    auto length           = std::max(0.01f, b2Length(world_to - world_from));
+                    auto dist_def         = b2DefaultDistanceJointDef();
+                    dist_def.bodyIdA      = body_from;
+                    dist_def.bodyIdB      = body_to;
+                    dist_def.localAnchorA = local_from;
+                    dist_def.localAnchorB = local_to;
+                    dist_def.length       = length;
+                    dist_def.enableLimit  = true;
+                    dist_def.minLength    = length * 0.05f;
+                    dist_def.maxLength    = length;
+
+                    return b2CreateDistanceJoint(g_world, &dist_def);
+                };
+
+                // Wire a sub-rope from existing segment bodies and push to g_ropes.
+                // anchor_first: true = anchor is body_a (left half), false = body_b (right half).
+                auto wire_half = [&make_dist](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segs, std::int32_t count, bool anchor_first)
+                {
+                    Rope half{};
+                    half.segments.assign(segs, segs + count);
+
+                    auto has_anchor = B2_IS_NON_NULL(anchor);
+
+                    if (anchor_first)
+                    {
+                        if (has_anchor)
+                        {
+                            half.body_a  = anchor;
+                            half.local_a = anchor_local;
+                            half.joints.emplace_back(make_dist(anchor, anchor_local, half.segments.front(), b2Vec2_zero));
+                        }
+
+                        for (std::int32_t i{}; i < count - 1; ++i)
+                        {
+                            half.joints.emplace_back(make_dist(half.segments[i], b2Vec2_zero, half.segments[i + 1], b2Vec2_zero));
+                        }
+                    }
+                    else
+                    {
+                        for (std::int32_t i{}; i < count - 1; ++i)
+                        {
+                            half.joints.emplace_back(make_dist(half.segments[i], b2Vec2_zero, half.segments[i + 1], b2Vec2_zero));
+                        }
+
+                        if (has_anchor)
+                        {
+                            half.body_b  = anchor;
+                            half.local_b = anchor_local;
+                            half.joints.emplace_back(make_dist(half.segments.back(), b2Vec2_zero, anchor, anchor_local));
+                        }
+                    }
+
+                    if (has_anchor)
+                    {
+                        for (std::int32_t i{}; i < count; ++i)
+                        {
+                            auto filter_def    = b2DefaultFilterJointDef();
+                            filter_def.bodyIdA = anchor;
+                            filter_def.bodyIdB = half.segments[i];
+
+                            half.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def));
+                        }
+                    }
+
+                    g_ropes.emplace_back(std::move(half));
+                };
+
+                // Move segments out - wire_half pushes to g_ropes which may invalidate `rope`.
+                auto all_segments = std::move(rope.segments);
+
+                if (left_count > 0)
+                {
+                    wire_half(body_a, anchor_a, all_segments.data(), left_count, true);
+                }
+
+                if (right_count > 0)
+                {
+                    wire_half(body_b, anchor_b, all_segments.data() + cut_seg, right_count, false);
+                }
+
+                // Remove the original rope (joints already destroyed, segments moved to halves).
+                g_ropes.erase(g_ropes.begin() + (std::ptrdiff_t)i);
+
+                --i;
+                --rope_count;
             }
         }
         else if (!g_current_stroke.empty())
@@ -1829,16 +2112,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
     {
         if (event->key.key == SDLK_DELETE || event->key.key == SDLK_BACKSPACE)
         {
-            // Delete selected bodies.
-            for (auto &&body : g_bodies)
-            {
-                if (body.selected)
-                {
-                    b2DestroyBody(body.body);
-                }
-            }
-
-            std::erase_if(g_bodies, [](const PhysBody &body) { return body.selected; });
+            delete_selected();
         }
         else if (event->key.key == SDLK_ESCAPE)
         {

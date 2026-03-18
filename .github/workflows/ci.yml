@@ -71,14 +71,21 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DPHYS_AVX2=${{ matrix.avx2 }}
 
-      # macOS: AppleClang + Ninja.
-      - name: Install Ninja
+      # macOS: LLVM Clang 20 + Ninja.
+      - name: Install LLVM Clang 20 and Ninja
         if: runner.os == 'macOS'
-        run: brew install ninja
+        run: |
+          brew install llvm@20 ninja
+          echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPHYS_AVX2=${{ matrix.avx2 }}
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPHYS_AVX2=${{ matrix.avx2 }}
 
       - name: Build
         run: cmake --build build
@@ -93,6 +100,7 @@ jobs:
           mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/scalable/apps
           cp build/phys AppDir/usr/bin/
           cp deploy/linux/phys.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          cp deploy/linux/phys.svg AppDir/
           cp deploy/linux/phys.desktop AppDir/
 
           ARCH=x86_64 ./appimagetool AppDir phys.AppImage
