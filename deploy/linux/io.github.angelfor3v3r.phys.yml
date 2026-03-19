@@ -17,6 +17,7 @@ build-options:
 modules:
   - name: phys
     buildsystem: cmake-ninja
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
       - -DPHYS_AVX2=OFF
