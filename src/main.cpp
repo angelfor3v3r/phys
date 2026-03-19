@@ -1093,17 +1093,17 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 }
             }
 
-            auto draw_filled = [bg](ImVec2 *verts, std::int32_t count, ImU32 color) noexcept
+            auto draw_filled = [bg](ImVec2 *verts, std::int32_t count, ImU32 fill_color) noexcept
             {
                 if (count == 4)
                 {
-                    bg->AddQuadFilled(verts[0], verts[1], verts[2], verts[3], color);
+                    bg->AddQuadFilled(verts[0], verts[1], verts[2], verts[3], fill_color);
                 }
                 else if (count >= 3)
                 {
                     for (std::int32_t i = 1; i < count - 1; ++i)
                     {
-                        bg->AddTriangleFilled(verts[0], verts[i], verts[i + 1], color);
+                        bg->AddTriangleFilled(verts[0], verts[i], verts[i + 1], fill_color);
                     }
                 }
             };
@@ -1430,7 +1430,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             bg->AddCircleFilled(screen_center, std::max(3.0f, 0.1f * g_cam_zoom), color);
 
             // Label on foreground so it's always visible.
-            char label[8];
+            char label[24];
             std::snprintf(label, sizeof(label), "e%zu", i);
             auto label_pos = screen_center + ImVec2{-8, -24};
             fg->AddText(label_pos, IM_COL32(255, 255, 255, 200), label);
@@ -2120,16 +2120,16 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                             half.joints.emplace_back(make_dist(anchor, anchor_local, half.segments.front(), b2Vec2_zero));
                         }
 
-                        for (std::int32_t i{}; i < count - 1; ++i)
+                        for (std::int32_t j{}; j < count - 1; ++j)
                         {
-                            half.joints.emplace_back(make_dist(half.segments[i], b2Vec2_zero, half.segments[i + 1], b2Vec2_zero));
+                            half.joints.emplace_back(make_dist(half.segments[j], b2Vec2_zero, half.segments[j + 1], b2Vec2_zero));
                         }
                     }
                     else
                     {
-                        for (std::int32_t i{}; i < count - 1; ++i)
+                        for (std::int32_t j{}; j < count - 1; ++j)
                         {
-                            half.joints.emplace_back(make_dist(half.segments[i], b2Vec2_zero, half.segments[i + 1], b2Vec2_zero));
+                            half.joints.emplace_back(make_dist(half.segments[j], b2Vec2_zero, half.segments[j + 1], b2Vec2_zero));
                         }
 
                         if (has_anchor)
@@ -2142,11 +2142,11 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
                     if (has_anchor)
                     {
-                        for (std::int32_t i{}; i < count; ++i)
+                        for (std::int32_t j{}; j < count; ++j)
                         {
                             auto filter_def    = b2DefaultFilterJointDef();
                             filter_def.bodyIdA = anchor;
-                            filter_def.bodyIdB = half.segments[i];
+                            filter_def.bodyIdB = half.segments[j];
 
                             half.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def));
                         }
