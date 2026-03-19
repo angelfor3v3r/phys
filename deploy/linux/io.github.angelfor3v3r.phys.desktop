@@ -2,6 +2,6 @@
 Type=Application
 Name=phys
 Exec=phys
-Icon=phys
+Icon=io.github.angelfor3v3r.phys
 Categories=Game;Simulation;
 Comment=2D physics sandbox

@@ -78,6 +78,20 @@ auto   g_cam_zoom     = ZOOM_DEFAULT;
 auto   g_cam_zoom_min = 1.0f;
 bool   g_cam_dragging{};
 
+// Graphics.
+int    g_vsync   = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
+int    g_fps_cap = 0;                           // 0 = off, 10-1000 = target FPS. Defaults to monitor refresh rate at init.
+Uint64 g_frame_start_ns{};
+float  g_phys_ms{};      // Last frame's physics time.
+float  g_render_ms{};    // Last frame's render time (draw list build).
+float  g_present_ms{};   // Last frame's GPU submit + present time.
+float  g_frame_ms{};     // Last frame's total time.
+int    g_display_fps{};  // FPS shown on screen, updated once per second.
+int    g_frame_count{};  // Frames counted in current second.
+Uint64 g_fps_timer_ns{}; // Timestamp of last FPS update.
+int    g_total_vtx{};    // Last frame's total vertex count.
+int    g_total_idx{};    // Last frame's total index count.
+
 // Bodies.
 b2BodyId g_ground_id = b2_nullBodyId;
 
@@ -122,7 +136,7 @@ struct Emitter
 
 std::vector<Emitter> g_emitters{};
 
-// Ropes: Chain of small circle bodies connected by revolute joints.
+// Ropes: Chain of small circle bodies connected by distance joints.
 struct Rope
 {
     std::vector<b2BodyId>  segments{};             // Intermediate chain links.
@@ -220,8 +234,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 [[nodiscard]] b2BodyId find_body_at(b2Vec2 world_point) noexcept
 {
-    auto proxy = b2MakeProxy(&world_point, 1, 0.01f);
-
+    auto     proxy  = b2MakeProxy(&world_point, 1, 0.01f);
     b2BodyId result = b2_nullBodyId;
     b2World_OverlapShape(
         g_world, &proxy, b2DefaultQueryFilter(),
@@ -297,7 +310,6 @@ void add_triangle(b2Vec2 position, float height)
         {-half_base, -height / 3.0f},
         {half_base, -height / 3.0f},
     };
-
     auto hull     = b2ComputeHull(verts, 3);
     auto poly     = b2MakePolygon(&hull, 0.0f);
     auto shape_id = b2CreatePolygonShape(body, &shape_def, &poly);
@@ -393,8 +405,7 @@ void tick_emitters(float dt)
             }
 
             // Apply velocity to the just-spawned body.
-            auto &spawned = g_bodies.back();
-
+            auto  &spawned = g_bodies.back();
             b2Vec2 dir{std::cos(emitter.angle), std::sin(emitter.angle)};
             b2Body_SetLinearVelocity(spawned.body, dir * emitter.speed);
         }
@@ -414,10 +425,9 @@ void reset_tasks() noexcept
 
 void *box2d_enqueue_task(b2TaskCallback *task, std::int32_t itemCount, std::int32_t minRange, void *taskContext, void *userContext)
 {
-    auto &pool = *(dp::thread_pool<> *)userContext;
-
-    auto chunk_size  = std::max(minRange, itemCount / (std::int32_t)g_worker_count);
-    auto chunk_count = (itemCount + chunk_size - 1) / chunk_size;
+    auto &pool        = *(dp::thread_pool<> *)userContext;
+    auto  chunk_size  = std::max(minRange, itemCount / (std::int32_t)g_worker_count);
+    auto  chunk_count = (itemCount + chunk_size - 1) / chunk_size;
 
     // Fallback: Run serially. `nullptr` tells Box2D to skip finishTask.
     if (g_task_count >= MAX_TASKS)
@@ -427,18 +437,15 @@ void *box2d_enqueue_task(b2TaskCallback *task, std::int32_t itemCount, std::int3
         return nullptr;
     }
 
-    auto *handle = new(&g_task_storage[g_task_count]) TaskHandle(chunk_count);
-    ++g_task_count;
+    auto *handle = new(&g_task_storage[g_task_count++]) TaskHandle(chunk_count);
 
     for (std::int32_t i{}; i < itemCount; i += chunk_size)
     {
         auto end = std::min(i + chunk_size, itemCount);
-
         pool.enqueue_detach(
             [=]
             {
                 thread_local std::uint32_t worker = g_next_worker++;
-
                 task(i, end, worker, taskContext);
 
                 handle->done.count_down();
@@ -490,7 +497,6 @@ void step_physics(float dt)
     }
 
     g_physics_accumulator += std::min(dt, MAX_FRAME_TIME);
-
     while (g_physics_accumulator >= PHYSICS_DT)
     {
         // Save previous transforms for interpolation.
@@ -547,6 +553,16 @@ SDL_AppResult SDL_AppInit([[maybe_unused]] void **appstate, [[maybe_unused]] std
     }
 #endif
 
+    // Default FPS cap to monitor refresh rate. Falls back to 0 (off) if unavailable - vsync handles pacing.
+    auto display = SDL_GetDisplayForWindow(g_window);
+    if (display != 0)
+    {
+        if (auto *mode = SDL_GetCurrentDisplayMode(display); mode != nullptr && mode->refresh_rate > 0.0f)
+        {
+            g_fps_cap = std::clamp((int)std::round(mode->refresh_rate), 10, 1000);
+        }
+    }
+
     g_dpi_scaling = SDL_GetWindowDisplayScale(g_window);
     if (g_dpi_scaling == 0.0f)
     {
@@ -566,13 +582,8 @@ SDL_AppResult SDL_AppInit([[maybe_unused]] void **appstate, [[maybe_unused]] std
         return SDL_APP_FAILURE;
     }
 
-    // SDL_SetRenderVSync(g_renderer, SDL_RENDERER_VSYNC_ADAPTIVE)
-    if (!SDL_SetRenderVSync(g_renderer, 1))
-    {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "phys", std::format("Error `SDL_SetRenderVSync()`: {}", SDL_GetError()).c_str(), nullptr);
-
-        return SDL_APP_FAILURE;
-    }
+    // VSync defaults to on. Non-fatal if unsupported.
+    SDL_SetRenderVSync(g_renderer, g_vsync);
 
     g_renderer_name = SDL_GetRendererName(g_renderer);
     if (g_renderer_name == nullptr)
@@ -652,6 +663,8 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         return SDL_APP_CONTINUE;
     }
 
+    g_frame_start_ns = SDL_GetTicksNS();
+
     SDL_GetWindowSize(g_window, &g_window_w, &g_window_h);
 
     // Clamp camera so the viewport never extends past the world boundary.
@@ -670,21 +683,29 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
     g_cam_center.y = std::clamp(g_cam_center.y, center_y - clamp_y, center_y + clamp_y);
 
     auto &io = ImGui::GetIO();
+
+    auto freq    = (double)SDL_GetPerformanceFrequency();
+    auto phys_t0 = SDL_GetPerformanceCounter();
+
     step_physics(io.DeltaTime);
 
-    // Kill bounds: Actual visible area at max zoom-out + margin.
-    auto kill_half_w = (float)g_window_w / 2.0f / g_cam_zoom_min + 5.0f;
-    auto kill_half_h = (float)g_window_h / 2.0f / g_cam_zoom_min + 5.0f;
-    auto kill_cx     = (AREA_MIN_X + AREA_MAX_X) / 2.0f;
-    auto kill_cy     = (AREA_MIN_Y + AREA_MAX_Y) / 2.0f;
+    // Exponential moving average (smoothing factor 0.01 = ~100 frame window).
+    auto phys_sample = (float)((double)(SDL_GetPerformanceCounter() - phys_t0) / freq * 1000.0);
+    g_phys_ms        = g_phys_ms + 0.01f * (phys_sample - g_phys_ms);
+
+    // Kill bounds: World area + margin so bodies don't pop out of existence at the edge.
+    constexpr auto KILL_MARGIN = 5.0f;
 
     // Destroy bodies that fall outside the playground.
     std::erase_if(
         g_bodies,
-        [kill_cx, kill_cy, kill_half_w, kill_half_h](const PhysBody &body)
+        [](const PhysBody &body)
         {
             auto pos = b2Body_GetPosition(body.body);
-            if (pos.x < kill_cx - kill_half_w || pos.x > kill_cx + kill_half_w || pos.y < kill_cy - kill_half_h || pos.y > kill_cy + kill_half_h)
+            if (pos.x < AREA_MIN_X - KILL_MARGIN
+                || pos.x > AREA_MAX_X + KILL_MARGIN
+                || pos.y < AREA_MIN_Y - KILL_MARGIN
+                || pos.y > AREA_MAX_Y + KILL_MARGIN)
             {
                 // Release mouse joint if we're about to destroy the dragged body.
                 if (B2_IS_NON_NULL(g_mouse_joint) && body.body.index1 == g_mouse_body.index1)
@@ -711,6 +732,9 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
     // Start the Dear ImGui frame.
     ImGui_ImplSDLRenderer3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
+
+    auto render_t0 = SDL_GetPerformanceCounter();
+
     ImGui::NewFrame();
     ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
 
@@ -763,6 +787,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         }
 
         ImGui::SeparatorText("Selection");
+
         int selected_count{};
         for (auto &&body : g_bodies)
         {
@@ -783,86 +808,117 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
         ImGui::EndDisabled();
 
-        ImGui::SeparatorText("Emitters");
-        if (ImGui::Button("Add Emitter"))
+        if (ImGui::CollapsingHeader("Emitters"))
         {
-            g_emitters.emplace_back(g_cam_center);
-        }
-
-        for (std::size_t i{}; i < g_emitters.size(); ++i)
-        {
-            ImGui::PushID((int)i);
-            auto &emitter = g_emitters[i];
-
-            ImGui::Checkbox("##active", &emitter.active);
-            ImGui::SameLine();
-            ImGui::Text("Emitter %zu", i);
-
-            auto angle_deg = emitter.angle * RAD_TO_DEG;
-            if (ImGui::SliderFloat("Angle", &angle_deg, -180.0f, 180.0f, "%.0f deg"))
+            if (ImGui::Button("Add Emitter"))
             {
-                emitter.angle = angle_deg * DEG_TO_RAD;
+                g_emitters.emplace_back(g_cam_center);
             }
 
-            ImGui::SliderFloat("Speed", &emitter.speed, 1.0f, 50.0f, "%.1f m/s");
-            ImGui::SliderFloat("Rate", &emitter.rate, 0.5f, 20.0f, "%.1f /s");
-
-            auto shape_idx = (int)emitter.shape;
-            if (ImGui::Combo("Shape", &shape_idx, "Box\0Circle\0Triangle\0"))
+            for (std::size_t i{}; i < g_emitters.size(); ++i)
             {
-                emitter.shape = (SpawnShape)shape_idx;
-            }
+                ImGui::PushID((int)i);
 
-            if (ImGui::Button("Remove"))
-            {
-                g_emitters.erase(g_emitters.begin() + (std::ptrdiff_t)i);
+                auto &emitter = g_emitters[i];
 
-                --i;
+                ImGui::Checkbox("##active", &emitter.active);
+                ImGui::SameLine();
+                ImGui::Text("Emitter %zu", i);
 
+                auto angle_deg = emitter.angle * RAD_TO_DEG;
+                if (ImGui::SliderFloat("Angle", &angle_deg, -180.0f, 180.0f, "%.0f deg"))
+                {
+                    emitter.angle = angle_deg * DEG_TO_RAD;
+                }
+
+                ImGui::SliderFloat("Speed", &emitter.speed, 1.0f, 50.0f, "%.1f m/s");
+                ImGui::SliderFloat("Rate", &emitter.rate, 0.5f, 20.0f, "%.1f /s");
+
+                auto shape_idx = (int)emitter.shape;
+                if (ImGui::Combo("Shape", &shape_idx, "Box\0Circle\0Triangle\0"))
+                {
+                    emitter.shape = (SpawnShape)shape_idx;
+                }
+
+                if (ImGui::Button("Remove"))
+                {
+                    g_emitters.erase(g_emitters.begin() + (std::ptrdiff_t)i);
+
+                    --i;
+
+                    ImGui::PopID();
+
+                    continue;
+                }
+
+                ImGui::Separator();
                 ImGui::PopID();
+            }
+        }
 
-                continue;
+        if (ImGui::CollapsingHeader("World"))
+        {
+            auto gravity = b2World_GetGravity(g_world);
+            if (ImGui::SliderFloat("Gravity", &gravity.y, -50.0f, 50.0f, "%.1f m/s^2"))
+            {
+                b2World_SetGravity(g_world, gravity);
             }
 
-            ImGui::Separator();
-            ImGui::PopID();
+            auto sleeping = b2World_IsSleepingEnabled(g_world);
+            if (ImGui::Checkbox("Sleeping", &sleeping))
+            {
+                b2World_EnableSleeping(g_world, sleeping);
+            }
+
+            ImGui::Checkbox("Paused", &g_paused);
+            ImGui::BeginDisabled(!g_paused);
+            ImGui::SameLine();
+
+            if (ImGui::Button("Step"))
+            {
+                g_single_step = true;
+            }
+
+            ImGui::SliderInt("Step count", &g_step_count, 1, 100);
+            ImGui::EndDisabled();
+            ImGui::SliderInt("Sub-steps", &g_sub_steps, 1, 8);
         }
 
-        ImGui::SeparatorText("World");
-        auto gravity = b2World_GetGravity(g_world);
-        if (ImGui::SliderFloat("Gravity", &gravity.y, -50.0f, 50.0f, "%.1f m/s^2"))
+        if (ImGui::CollapsingHeader("Info", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            b2World_SetGravity(g_world, gravity);
+            ImGui::Text("Bodies: %zu (%d awake, %zu culled)", g_bodies.size(), b2World_GetAwakeBodyCount(g_world), g_culled_count);
+            ImGui::Text("Workers: %u", g_worker_count);
+
+            auto counters = b2World_GetCounters(g_world);
+            ImGui::Text("Islands: %d", counters.islandCount);
+            ImGui::Text("Contacts: %d", counters.contactCount);
+            ImGui::Text("Camera: (%.1f, %.1f) zoom %.1f", g_cam_center.x + 0.0f, g_cam_center.y + 0.0f, g_cam_zoom);
+            ImGui::Text("Ropes: %zu", g_ropes.size());
+            ImGui::Text("Physics: %.2f ms", g_phys_ms);
+            ImGui::Text("Render:  %.2f ms", g_render_ms);
+            ImGui::Text("Present: %.2f ms", g_present_ms);
+            ImGui::Text("Frame:   %.2f ms", g_frame_ms);
+            ImGui::Text("Vertices: %d | Indices: %d", g_total_vtx, g_total_idx);
         }
 
-        auto sleeping = b2World_IsSleepingEnabled(g_world);
-        if (ImGui::Checkbox("Sleeping", &sleeping))
+        if (ImGui::CollapsingHeader("Graphics"))
         {
-            b2World_EnableSleeping(g_world, sleeping);
+            // VSync mode: Maps combo index to SDL vsync values.
+            constexpr int vsync_values[] = {SDL_RENDERER_VSYNC_DISABLED, 1, SDL_RENDERER_VSYNC_ADAPTIVE};
+            const char   *vsync_labels[] = {"Off", "On", "Adaptive"};
+            int           vsync_index    = g_vsync == SDL_RENDERER_VSYNC_ADAPTIVE ? 2 : g_vsync;
+            if (ImGui::Combo("VSync", &vsync_index, vsync_labels, 3))
+            {
+                g_vsync = vsync_values[vsync_index];
+                SDL_SetRenderVSync(g_renderer, g_vsync);
+            }
+
+            ImGui::SliderInt("FPS Cap", &g_fps_cap, 0, 1000, g_fps_cap == 0 ? "Off" : "%d");
+            if (g_fps_cap > 0)
+            {
+                g_fps_cap = std::clamp(g_fps_cap, 10, 1000);
+            }
         }
-
-        ImGui::Checkbox("Paused", &g_paused);
-        ImGui::BeginDisabled(!g_paused);
-        ImGui::SameLine();
-
-        if (ImGui::Button("Step"))
-        {
-            g_single_step = true;
-        }
-
-        ImGui::SliderInt("Step count", &g_step_count, 1, 100);
-        ImGui::EndDisabled();
-        ImGui::SliderInt("Sub-steps", &g_sub_steps, 1, 8);
-
-        ImGui::SeparatorText("Info");
-        ImGui::Text("Bodies: %zu (%d awake, %zu culled)", g_bodies.size(), b2World_GetAwakeBodyCount(g_world), g_culled_count);
-        ImGui::Text("Workers: %u", g_worker_count);
-
-        auto counters = b2World_GetCounters(g_world);
-        ImGui::Text("Islands: %d", counters.islandCount);
-        ImGui::Text("Contacts: %d", counters.contactCount);
-        ImGui::Text("Camera: (%.1f, %.1f) zoom %.1f", g_cam_center.x, g_cam_center.y, g_cam_zoom);
-        ImGui::Text("Ropes: %zu", g_ropes.size());
 
         if (ImGui::CollapsingHeader("Controls"))
         {
@@ -893,10 +949,9 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
     // Handle drag-drop onto viewport.
     if (auto *payload = ImGui::GetDragDropPayload(); payload != nullptr && payload->IsDataType("SPAWN"))
     {
+        // Ghost preview.
         auto world_point = screen_to_world(mouse_pos.x, mouse_pos.y);
         auto type        = *(SpawnShape *)payload->Data;
-
-        // Ghost preview.
         switch (type)
         {
         case SpawnShape::Box:
@@ -971,8 +1026,18 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
     fg->AddText({4, 4}, IM_COL32_WHITE, g_renderer_name);
 
+    ++g_frame_count;
+
+    auto now_ns = SDL_GetTicksNS();
+    if (now_ns - g_fps_timer_ns >= SDL_NS_PER_SECOND)
+    {
+        g_display_fps  = g_frame_count;
+        g_frame_count  = 0;
+        g_fps_timer_ns = now_ns;
+    }
+
     char fps_buf[32];
-    std::snprintf(fps_buf, sizeof(fps_buf), "%ld FPS", std::lround(io.Framerate));
+    std::snprintf(fps_buf, sizeof(fps_buf), "%d FPS", g_display_fps);
     fg->AddText({4, 20}, IM_COL32_WHITE, fps_buf);
 
     // Box select preview.
@@ -984,6 +1049,11 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
     // Render physics bodies to background draw list.
     {
+        // Disable fill anti-aliasing for body rendering - saves ~2x vertices per filled shape.
+        // Outlines keep AA via `ImDrawListFlags_AntiAliasedLines` (unchanged).
+        auto old_flags  = bg->Flags;
+        bg->Flags      &= ~ImDrawListFlags_AntiAliasedFill;
+
         // Camera transform - snap to pixel grid to avoid subpixel blurriness.
         auto cam_x = std::round((float)g_window_w / 2.0f - g_cam_center.x * g_cam_zoom);
         auto cam_y = std::round((float)g_window_h / 2.0f + g_cam_center.y * g_cam_zoom);
@@ -998,28 +1068,28 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             ImVec2 screen[B2_MAX_POLYGON_VERTICES]{};
             ImVec2 inset[B2_MAX_POLYGON_VERTICES]{};
             auto   border_world = BORDER_PX / g_cam_zoom;
-            for (std::int32_t j{}; j < poly.count; ++j)
+            for (std::int32_t i{}; i < poly.count; ++i)
             {
                 // Corner bisector from Box2D's precomputed unit normals.
-                auto prev   = (j + poly.count - 1) % poly.count;
-                auto bisect = b2Normalize(poly.normals[prev] + poly.normals[j]);
-                auto d      = b2Dot(bisect, poly.normals[j]);
+                auto prev_idx   = (i + poly.count - 1) % poly.count;
+                auto bisect     = b2Normalize(poly.normals[prev_idx] + poly.normals[i]);
+                auto bisect_dot = b2Dot(bisect, poly.normals[i]);
 
-                // Shrink by linear slop so shapes appear flush when the solver allows slight overlap - See: `B2_LINEAR_SLOP`.
-                auto r      = std::max(0.0f, poly.radius - 0.005f * b2GetLengthUnitsPerMeter());
-                auto offset = d > 0.0f ? r / d : r;
-                auto local  = poly.vertices[j] + bisect * offset;
+                // Shrink by linear slop so shapes appear flush when the solver allows slight overlap - see `B2_LINEAR_SLOP`.
+                auto radius       = std::max(0.0f, poly.radius - 0.005f * b2GetLengthUnitsPerMeter());
+                auto outer_offset = bisect_dot > 0.0f ? radius / bisect_dot : radius;
+                auto outer_local  = poly.vertices[i] + bisect * outer_offset;
 
-                screen[j] = to_screen(b2RotateVector(rot, local) + pos);
+                screen[i] = to_screen(b2RotateVector(rot, outer_local) + pos);
 
                 // Inset vertex: Same bisector, reduced offset. Gives uniform border_world inset per edge.
                 if (show_edge)
                 {
-                    auto inset_r   = r - border_world;
-                    auto inset_off = d > 0.0f ? inset_r / d : inset_r;
-                    auto inset_loc = poly.vertices[j] + bisect * inset_off;
+                    auto inner_radius = radius - border_world;
+                    auto inner_offset = bisect_dot > 0.0f ? inner_radius / bisect_dot : inner_radius;
+                    auto inner_local  = poly.vertices[i] + bisect * inner_offset;
 
-                    inset[j] = to_screen(b2RotateVector(rot, inset_loc) + pos);
+                    inset[i] = to_screen(b2RotateVector(rot, inner_local) + pos);
                 }
             }
 
@@ -1031,18 +1101,24 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 }
                 else if (count >= 3)
                 {
-                    for (std::int32_t j = 1; j < count - 1; ++j)
+                    for (std::int32_t i = 1; i < count - 1; ++i)
                     {
-                        bg->AddTriangleFilled(verts[0], verts[j], verts[j + 1], color);
+                        bg->AddTriangleFilled(verts[0], verts[i], verts[i + 1], color);
                     }
                 }
             };
 
             if (show_edge)
             {
-                // Edge rim: fill outer with brighter color, fill inset with body color.
+                // Edge rim: Outer fill with AA for smooth silhouette, inner fill without.
                 auto edge_color = brighten(color, 60);
+
+                bg->Flags |= ImDrawListFlags_AntiAliasedFill;
+
                 draw_filled(screen, poly.count, edge_color);
+
+                bg->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+
                 draw_filled(inset, poly.count, color);
             }
             else
@@ -1076,7 +1152,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
         // Viewport culling AABB in world space.
         // Margin accounts for shape radius so partially-visible bodies aren't culled.
-        constexpr float CULL_MARGIN_WORLD = 2.0f; // Meters (covers shapes up to 4m diameter).
+        constexpr auto CULL_MARGIN_WORLD = 2.0f; // Meters (covers shapes up to 4m diameter).
 
         auto view_min  = screen_to_world(0.0f, (float)g_window_h);
         auto view_max  = screen_to_world((float)g_window_w, 0.0f);
@@ -1174,7 +1250,6 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 auto world_center  = b2RotateVector(rot, circle.center) + pos;
                 auto screen_center = to_screen(world_center);
                 auto screen_radius = circle.radius * g_cam_zoom;
-
                 if (outline_enabled)
                 {
                     auto edge_color = brighten(fill_color, 60);
@@ -1360,17 +1435,46 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             auto label_pos = screen_center + ImVec2{-8, -24};
             fg->AddText(label_pos, IM_COL32(255, 255, 255, 200), label);
         }
+
+        bg->Flags = old_flags;
     }
 
+    auto render_sample = (float)((double)(SDL_GetPerformanceCounter() - render_t0) / freq * 1000.0);
+    g_render_ms        = g_render_ms + 0.01f * (render_sample - g_render_ms);
+
+    auto present_t0 = SDL_GetPerformanceCounter();
+
     ImGui::Render();
+
+    auto *draw_data = ImGui::GetDrawData();
+    g_total_vtx     = draw_data->TotalVtxCount;
+    g_total_idx     = draw_data->TotalIdxCount;
+
     SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
 
     constexpr ImVec4 clear_color(0.10f, 0.10f, 0.10f, 1.00f);
     SDL_SetRenderDrawColorFloat(g_renderer, clear_color.x, clear_color.y, clear_color.z, clear_color.w);
 
     SDL_RenderClear(g_renderer);
-    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
+    ImGui_ImplSDLRenderer3_RenderDrawData(draw_data, g_renderer);
     SDL_RenderPresent(g_renderer);
+
+    auto present_sample = (float)((double)(SDL_GetPerformanceCounter() - present_t0) / freq * 1000.0);
+    g_present_ms        = g_present_ms + 0.01f * (present_sample - g_present_ms);
+
+    auto frame_sample = (float)((double)(SDL_GetPerformanceCounter() - phys_t0) / freq * 1000.0);
+    g_frame_ms        = g_frame_ms + 0.01f * (frame_sample - g_frame_ms);
+
+    // FPS cap: Delay to hit target frame time.
+    if (g_fps_cap > 0)
+    {
+        auto target_ns = SDL_NS_PER_SECOND / (Uint64)g_fps_cap;
+        auto elapsed   = SDL_GetTicksNS() - g_frame_start_ns;
+        if (elapsed + SDL_NS_PER_MS < target_ns)
+        {
+            SDL_DelayPrecise(target_ns - elapsed);
+        }
+    }
 
     return SDL_APP_CONTINUE;
 }
@@ -1555,7 +1659,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             else
             {
                 // Check emitters first (small grab radius in world units).
-                constexpr float EMITTER_GRAB_RADIUS = 0.5f;
+                constexpr auto EMITTER_GRAB_RADIUS = 0.5f;
                 for (std::int32_t i{}; i < (std::int32_t)g_emitters.size(); ++i)
                 {
                     if (b2LengthSquared(world_point - g_emitters[i].position) <= EMITTER_GRAB_RADIUS * EMITTER_GRAB_RADIUS)
@@ -1999,7 +2103,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 };
 
                 // Wire a sub-rope from existing segment bodies and push to g_ropes.
-                // anchor_first: true = anchor is body_a (left half), false = body_b (right half).
+                // `anchor_first`: true = `anchor` is `body_a` (left half), false = `body_b` (right half).
                 auto wire_half = [&make_dist](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segs, std::int32_t count, bool anchor_first)
                 {
                     Rope half{};

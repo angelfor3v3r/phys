@@ -5,7 +5,7 @@
 ## Build
 
 ```bash
-# Clang (GNU frontend) or MSVC. CMake 3.28+.
+# GCC, Clang (GNU frontend), or MSVC. CMake 3.28+.
 cmake -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build cmake-build-debug
 # Release
@@ -27,7 +27,7 @@ Dependencies are fetched automatically via CPM (no manual installs).
 src/main.cpp          -- Entire application (single TU)
 src/imconfig.hpp      -- Dear ImGui compile-time config (custom, not upstream)
 deploy/windows/       -- phys.ico, phys.manifest, phys.rc (icon + manifest resource)
-deploy/linux/         -- phys.desktop, phys.svg (AppImage assets)
+deploy/linux/         -- Flatpak manifest, .desktop, phys.svg (icon)
 third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 .clang-format         -- clang-format 20 config
 ```
@@ -78,7 +78,7 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 
 ## Platform notes
 
-- Windows, Linux, and macOS. Clang (GNU frontend, LLVM 20) or MSVC. AppleClang is NOT supported (missing `std::jthread`/`std::stop_token`).
+- Windows, Linux, and macOS. GCC, Clang (GNU frontend, LLVM 20), or MSVC. AppleClang is NOT supported (missing `std::jthread`/`std::stop_token`).
 - AVX2 is a CMake option (`PHYS_AVX2`): ON by default for x86_64, OFF for ARM. Non-AVX2 builds use scalar fallbacks.
 - Windows: hooks `WndProc` for `DwmFlush()` on `WM_MOVING` (drag stutter fix), links `dwmapi`.
 - Static MSVC runtime on Windows (`/MT` / `/MTd`).
@@ -87,6 +87,12 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - Clang-on-Windows: `/MANIFEST:EMBED` stripped from link command to avoid conflict with RC-embedded manifest.
 - Renderer preference: D3D12 > D3D11 > Metal > Vulkan > OpenGL > software.
 - Camera pixel-snapped via `std::round()` to avoid subpixel blurriness.
+- Adaptive vsync by default (`SDL_RENDERER_VSYNC_ADAPTIVE`), falls back to regular vsync if unsupported.
+- FPS cap defaults to monitor refresh rate, uses `SDL_DelayPrecise` (skipped when <1ms slack remains — avoids fighting driver vsync).
+- Graphics section in UI: VSync dropdown (Off/On/Adaptive), FPS cap slider (Off or 10-1000).
+- Frame timers in Info: Physics, Render, Present, Frame (EMA-smoothed, ~100 frame window).
+- Fill anti-aliasing disabled for body rendering (2x vertex savings). Outer outline fill retains AA for smooth silhouette.
+- Kill bounds: `AREA_MIN/MAX ± 5m` margin, tied to world bounds (not viewport-derived).
 
 ## Conventions
 
@@ -94,7 +100,7 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - Body creation always appends to `g_bodies` with a `BodyState` for interpolation.
 - Body deletion goes through `delete_selected()` — both the ImGui button and Delete key call it.
 - All coordinate transforms go through `screen_to_world()` or the `to_screen` lambda in the render block.
-- Out-of-bounds body cleanup happens every frame at the top of `SDL_AppIterate`.
+- Kill bounds: `AREA_MIN/MAX ± 5m` — tied to world bounds, not viewport. Bodies destroyed just past the world edge.
 
 - Rope cleanup: prune ropes with dead anchors each frame, destroy orphaned segment bodies + joints.
 - Rope cutting (Shift+Right drag): destroys all joints, splits segments into two half-ropes re-wired at current separations. `wire_half` guards null anchors (dangling ends get no anchor joint or filter joints).

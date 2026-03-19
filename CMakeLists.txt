@@ -18,10 +18,14 @@ endif ()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
     set(PHYS_IS_CLANG ON)
+    set(PHYS_IS_GNU_LIKE ON)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(PHYS_IS_GCC ON)
+    set(PHYS_IS_GNU_LIKE ON)
 elseif (PHYS_IS_WINDOWS AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(PHYS_IS_MSVC ON)
 else ()
-    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only Clang (GNU frontend) and MSVC are supported.")
+    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only GCC, Clang (GNU frontend), and MSVC are supported.")
 endif ()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -50,7 +54,7 @@ CPMAddPackage(URI "gh:ptsouchlos/thread-pool#0.7.0"
     "TP_BUILD_TESTS OFF"
     "TP_BUILD_EXAMPLES OFF"
     "TP_BUILD_BENCHMARKS OFF")
-CPMAddPackage(URI "gh:freetype/freetype#VER-2-14-1"
+CPMAddPackage(URI "gh:freetype/freetype#VER-2-14-2"
     OPTIONS
     "FT_DISABLE_ZLIB ON"
     "FT_DISABLE_BZIP2 ON"
@@ -105,7 +109,6 @@ if (imgui_ADDED)
     add_library(imgui::imgui ALIAS imgui)
 endif ()
 
-
 # set(PHYS_HEADERS ...)
 set(PHYS_SOURCES src/main.cpp)
 
@@ -129,7 +132,7 @@ target_compile_definitions(phys PRIVATE
     SDL_MAIN_USE_CALLBACKS)
 target_include_directories(phys PRIVATE src)
 
-if (PHYS_IS_CLANG)
+if (PHYS_IS_GNU_LIKE)
     target_compile_options(phys
         PRIVATE
         -Wall
@@ -138,13 +141,13 @@ if (PHYS_IS_CLANG)
         -pedantic
         -Werror=unused-variable
         -Wno-non-virtual-dtor
-        -Wno-unused-private-field)
+        $<$<BOOL:${PHYS_IS_CLANG}>:-Wno-unused-private-field>)
     target_compile_options(phys PRIVATE $<$<CONFIG:Debug>:-g3 -O0>)
     target_compile_options(phys PRIVATE $<$<CONFIG:Release>:-fno-ident -g0 -O3>)
     target_compile_options(phys PRIVATE $<$<CONFIG:RelWithDebInfo>:-g3 -O3>)
 
     if (PHYS_IS_WINDOWS)
-        # Clang auto-embeds a manifest via /MANIFEST:EMBED which conflicts with our .rc manifest.
+        # Clang auto-embeds a manifest via `/MANIFEST:EMBED` which conflicts with our `.rc` manifest.
         string(REPLACE " -Xlinker /MANIFEST:EMBED" "" CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE}")
     elseif (PHYS_IS_LINUX)
         target_link_options(phys PRIVATE -static-libgcc -static-libstdc++)
@@ -164,3 +167,12 @@ elseif (PHYS_IS_MSVC)
 endif ()
 
 target_link_libraries(phys PRIVATE dp::thread-pool SDL3::SDL3-static imgui::imgui box2d::box2d $<$<BOOL:${PHYS_IS_WINDOWS}>:dwmapi>)
+
+# Install rules (used by Flatpak and system installs).
+include(GNUInstallDirs)
+install(TARGETS phys RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if (PHYS_IS_LINUX)
+    install(FILES deploy/linux/io.github.angelfor3v3r.phys.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    install(FILES deploy/linux/phys.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps RENAME io.github.angelfor3v3r.phys.svg)
+endif ()
