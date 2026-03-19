@@ -69,8 +69,10 @@ float        g_physics_accumulator{};
 float        g_physics_alpha{};
 bool         g_paused{};
 bool         g_single_step{};
-std::int32_t g_step_count = 1;
-std::int32_t g_sub_steps  = 4;
+std::int32_t g_step_count     = 1;
+std::int32_t g_sub_steps      = 4;
+auto         g_linear_damping = 0.1f;
+auto         g_random_damping = 0.02f; // Max random offset added to base drag per body.
 std::size_t  g_culled_count{};
 
 // Camera.
@@ -82,16 +84,16 @@ bool   g_cam_dragging{};
 // Graphics.
 int    g_vsync   = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
 int    g_fps_cap = 0;                           // 0 = off, 10-1000 = target FPS. Defaults to monitor refresh rate at init.
-Uint64 g_frame_start_ns{};
-float  g_phys_ms{};      // Last frame's physics time.
-float  g_render_ms{};    // Last frame's render time (draw list build).
-float  g_present_ms{};   // Last frame's GPU submit + present time.
-float  g_frame_ms{};     // Last frame's total time.
-int    g_display_fps{};  // FPS shown on screen, updated once per second.
-int    g_frame_count{};  // Frames counted in current second.
-Uint64 g_fps_timer_ns{}; // Timestamp of last FPS update.
-int    g_total_vtx{};    // Last frame's total vertex count.
-int    g_total_idx{};    // Last frame's total index count.
+Uint64 g_frame_start_ns{};                      // Counter at start of frame (Nanoseconds since SDL initialization).
+float  g_phys_ms{};                             // Last frame's physics time.
+float  g_render_ms{};                           // Last frame's render time (draw list build).
+float  g_present_ms{};                          // Last frame's GPU submit + present time.
+float  g_frame_ms{};                            // Last frame's total time.
+int    g_display_fps{};                         // FPS shown on screen, updated once per second.
+int    g_frame_count{};                         // Frames counted in current second.
+Uint64 g_fps_timer_ns{};                        // Timestamp of last FPS update.
+int    g_total_vtx{};                           // Last frame's total vertex count.
+int    g_total_idx{};                           // Last frame's total index count.
 
 // Bodies.
 b2BodyId g_ground_id = b2_nullBodyId;
@@ -108,6 +110,7 @@ struct PhysBody
     b2ShapeId   shape      = b2_nullShapeId;
     b2ShapeType shape_type = b2_shapeTypeCount;
     BodyState   prev{};
+    float       damping_offset{}; // Random addition to g_linear_damping.
     bool        selected{};
 };
 
@@ -136,6 +139,32 @@ struct Emitter
 };
 
 std::vector<Emitter> g_emitters{};
+
+// Force zones: Areas that apply forces to dynamic bodies.
+enum class FieldType : std::uint8_t
+{
+    Uniform = 0, // Constant direction (uses angle).
+    Vortex,      // Tangential swirl around center (sign of strength = CW/CCW).
+    RadialIn,    // Pull toward center (gravity well).
+    RadialOut,   // Push away from center (explosion).
+    Count,
+};
+
+struct ForceZone
+{
+    b2Vec2       position{};
+    b2Vec2       half_size{2.0f, 2.0f};   // Half extents (Uniform).
+    float        angle{};                 // Radians, 0 = right. Used by Uniform only.
+    float        strength        = 20.0f; // Acceleration (m/s^2). Negative strength reverses vortex direction.
+    float        max_speed       = 30.0f; // Terminal velocity (m/s). Force scales to zero at this speed. 0 = unlimited.
+    float        radius          = 5.0f;  // Area-of-effect for Vortex/Radial types.
+    std::int32_t grid_resolution = 5;     // Arrow grid NxN resolution.
+    FieldType    type            = FieldType::Uniform;
+    bool         active          = true;
+};
+
+std::vector<ForceZone>     g_force_zones{};
+std::optional<std::size_t> g_dragging_zone{};
 
 // Ropes: Chain of small circle bodies connected by distance joints.
 struct Rope
@@ -169,6 +198,7 @@ std::optional<std::size_t> g_dragged_emitter{};
 bool                       g_erasing{};
 bool                       g_cutting{};
 bool                       g_just_pinned{};
+bool                       g_just_cut{};
 
 struct TaskHandle
 {
@@ -201,9 +231,9 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // Brighten an `ImU32` color by adding `amount` to each RGB channel, clamped to 255.
 [[nodiscard]] constexpr ImU32 brighten(ImU32 color, int amount) noexcept
 {
-    auto r = std::min(255, (int)(color >> IM_COL32_R_SHIFT & 0xFF) + amount);
-    auto g = std::min(255, (int)(color >> IM_COL32_G_SHIFT & 0xFF) + amount);
-    auto b = std::min(255, (int)(color >> IM_COL32_B_SHIFT & 0xFF) + amount);
+    int r = std::min(255, (int)(color >> IM_COL32_R_SHIFT & 0xFF) + amount);
+    int g = std::min(255, (int)(color >> IM_COL32_G_SHIFT & 0xFF) + amount);
+    int b = std::min(255, (int)(color >> IM_COL32_B_SHIFT & 0xFF) + amount);
 
     return IM_COL32(r, g, b, 255);
 }
@@ -258,9 +288,11 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 void add_box(b2Vec2 position, float half_width, float half_height)
 {
-    auto body_def     = b2DefaultBodyDef();
-    body_def.type     = b2_dynamicBody;
-    body_def.position = position;
+    auto random_offset     = SDL_randf() * g_random_damping;
+    auto body_def          = b2DefaultBodyDef();
+    body_def.type          = b2_dynamicBody;
+    body_def.position      = position;
+    body_def.linearDamping = g_linear_damping + random_offset;
 
     auto body = b2CreateBody(g_world, &body_def);
 
@@ -271,14 +303,16 @@ void add_box(b2Vec2 position, float half_width, float half_height)
     auto box      = b2MakeBox(half_width, half_height);
     auto shape_id = b2CreatePolygonShape(body, &shape_def, &box);
 
-    g_bodies.emplace_back(body, shape_id, b2_polygonShape, BodyState{position, b2Rot_identity});
+    g_bodies.emplace_back(body, shape_id, b2_polygonShape, BodyState{position, b2Rot_identity}, random_offset);
 }
 
 void add_circle(b2Vec2 position, float radius)
 {
-    auto body_def     = b2DefaultBodyDef();
-    body_def.type     = b2_dynamicBody;
-    body_def.position = position;
+    auto random_offset     = SDL_randf() * g_random_damping;
+    auto body_def          = b2DefaultBodyDef();
+    body_def.type          = b2_dynamicBody;
+    body_def.position      = position;
+    body_def.linearDamping = g_linear_damping + random_offset;
 
     auto body = b2CreateBody(g_world, &body_def);
 
@@ -289,14 +323,16 @@ void add_circle(b2Vec2 position, float radius)
     b2Circle circle{{0.0f, 0.0f}, radius};
     auto     shape_id = b2CreateCircleShape(body, &shape_def, &circle);
 
-    g_bodies.emplace_back(body, shape_id, b2_circleShape, BodyState{position, b2Rot_identity});
+    g_bodies.emplace_back(body, shape_id, b2_circleShape, BodyState{position, b2Rot_identity}, random_offset);
 }
 
 void add_triangle(b2Vec2 position, float height)
 {
-    auto body_def     = b2DefaultBodyDef();
-    body_def.type     = b2_dynamicBody;
-    body_def.position = position;
+    auto random_offset     = SDL_randf() * g_random_damping;
+    auto body_def          = b2DefaultBodyDef();
+    body_def.type          = b2_dynamicBody;
+    body_def.position      = position;
+    body_def.linearDamping = g_linear_damping + random_offset;
 
     auto body = b2CreateBody(g_world, &body_def);
 
@@ -315,7 +351,7 @@ void add_triangle(b2Vec2 position, float height)
     auto poly     = b2MakePolygon(&hull, 0.0f);
     auto shape_id = b2CreatePolygonShape(body, &shape_def, &poly);
 
-    g_bodies.emplace_back(body, shape_id, b2_polygonShape, BodyState{position, b2Rot_identity});
+    g_bodies.emplace_back(body, shape_id, b2_polygonShape, BodyState{position, b2Rot_identity}, random_offset);
 }
 
 [[nodiscard]] DrawnLine create_drawn_line(std::vector<b2Vec2> points)
@@ -467,6 +503,144 @@ void tick_emitters(float dt)
     }
 }
 
+void tick_force_zones()
+{
+    for (auto &&zone : g_force_zones)
+    {
+        if (!zone.active)
+        {
+            continue;
+        }
+
+        // Build AABB for the overlap query.
+        b2AABB aabb;
+        if (zone.type == FieldType::Uniform)
+        {
+            auto lower = zone.position - zone.half_size;
+            auto upper = zone.position + zone.half_size;
+            aabb       = {lower, upper};
+        }
+        else
+        {
+            // Radial/vortex: Circular area, use radius for AABB.
+            b2Vec2 extent{zone.radius, zone.radius};
+            aabb = {zone.position - extent, zone.position + extent};
+        }
+
+        // Context passed to the overlap callback via `void*`.
+        struct Context
+        {
+            b2Vec2    center;
+            float     strength;
+            float     max_speed;
+            float     radius_sq;
+            float     angle;
+            FieldType type;
+        } context{zone.position, zone.strength, zone.max_speed, zone.radius * zone.radius, zone.angle, zone.type};
+
+        b2World_OverlapAABB(
+            g_world, aabb, b2DefaultQueryFilter(),
+            [](b2ShapeId shape_id, void *user_data)
+            {
+                auto body = b2Shape_GetBody(shape_id);
+                if (b2Body_GetType(body) != b2_dynamicBody)
+                {
+                    return true;
+                }
+
+                constexpr auto MIN_DIST_SQ = 1e-6f; // Avoid division by zero at center.
+
+                auto  &ctx      = *(Context *)user_data;
+                auto   mass     = b2Body_GetMass(body);
+                auto   body_pos = b2Body_GetPosition(body);
+                auto   delta    = body_pos - ctx.center;
+                auto   dist_sq  = b2LengthSquared(delta);
+                b2Vec2 force{};
+                auto   angle_rot = b2MakeRot(ctx.angle);
+                switch (ctx.type)
+                {
+                case FieldType::Uniform:
+                {
+                    b2Vec2 direction{std::cos(ctx.angle), std::sin(ctx.angle)};
+                    force = direction * (ctx.strength * mass);
+
+                    break;
+                }
+                case FieldType::Vortex:
+                {
+                    if (dist_sq < MIN_DIST_SQ || dist_sq > ctx.radius_sq)
+                    {
+                        return true;
+                    }
+
+                    auto   dist       = std::sqrt(dist_sq);
+                    auto   inv_dist   = 1.0f / dist;
+                    auto   normalized = delta * inv_dist;
+                    auto   falloff    = 1.0f - dist / std::sqrt(ctx.radius_sq);
+                    b2Vec2 tangent{-normalized.y, normalized.x};
+                    force = b2RotateVector(angle_rot, tangent) * (ctx.strength * mass * falloff);
+
+                    break;
+                }
+                case FieldType::RadialIn:
+                {
+                    if (dist_sq < MIN_DIST_SQ || dist_sq > ctx.radius_sq)
+                    {
+                        return true;
+                    }
+
+                    auto dist      = std::sqrt(dist_sq);
+                    auto inv_dist  = 1.0f / dist;
+                    auto direction = delta * inv_dist;
+                    auto falloff   = 1.0f - dist / std::sqrt(ctx.radius_sq);
+                    force          = b2RotateVector(angle_rot, direction * -1.0f) * (ctx.strength * mass * falloff);
+
+                    break;
+                }
+                case FieldType::RadialOut:
+                {
+                    if (dist_sq < MIN_DIST_SQ || dist_sq > ctx.radius_sq)
+                    {
+                        return true;
+                    }
+
+                    auto dist      = std::sqrt(dist_sq);
+                    auto inv_dist  = 1.0f / dist;
+                    auto direction = delta * inv_dist;
+                    auto falloff   = 1.0f - dist / std::sqrt(ctx.radius_sq);
+                    force          = b2RotateVector(angle_rot, direction) * (ctx.strength * mass * falloff);
+
+                    break;
+                }
+
+                default:
+                {
+                    return true;
+                }
+                }
+
+                // Terminal velocity: scale force to zero as body approaches max_speed.
+                if (ctx.max_speed > 0.0f)
+                {
+                    auto force_len_sq = b2LengthSquared(force);
+                    if (force_len_sq > 1e-6f)
+                    {
+                        auto force_dir      = force * (1.0f / std::sqrt(force_len_sq));
+                        auto velocity       = b2Body_GetLinearVelocity(body);
+                        auto speed_along    = b2Dot(velocity, force_dir);
+                        auto speed_fraction = std::max(0.0f, speed_along) / ctx.max_speed;
+                        force               = force * std::max(0.0f, 1.0f - speed_fraction);
+                    }
+                }
+
+                b2Body_ApplyForceToCenter(body, force, true);
+
+                return true;
+            },
+            &context);
+    }
+}
+
 void reset_tasks() noexcept
 {
     for (std::int32_t i{}; i < g_task_count; ++i)
@@ -544,6 +718,7 @@ void step_physics(float dt)
         }
 
         tick_emitters(PHYSICS_DT * (float)g_step_count);
+        tick_force_zones();
 
         g_single_step   = false;
         g_physics_alpha = 1.0f;
@@ -782,6 +957,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
     if (!g_paused)
     {
         tick_emitters(io.DeltaTime);
+        tick_force_zones();
     }
 
     // Start the Dear ImGui frame.
@@ -909,6 +1085,65 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             }
         }
 
+        if (ImGui::CollapsingHeader("Force Zones"))
+        {
+            if (ImGui::Button("Add Zone"))
+            {
+                g_force_zones.emplace_back(g_cam_center);
+            }
+
+            for (std::size_t i{}; i < g_force_zones.size(); ++i)
+            {
+                ImGui::PushID((int)i);
+
+                auto &zone = g_force_zones[i];
+
+                ImGui::Checkbox("##active", &zone.active);
+                ImGui::SameLine();
+                ImGui::Text("Zone (z%zu)", i);
+
+                int type_idx = (int)zone.type;
+                combo("Type", type_idx, "Uniform\0Vortex\0Radial In\0Radial Out\0", (int)FieldType::Count);
+
+                zone.type = (FieldType)type_idx;
+
+                auto angle_deg = zone.angle * RAD_TO_DEG;
+                slider("Angle", angle_deg, -180.0f, 180.0f, 5.0f, "%.0f deg");
+
+                zone.angle = angle_deg * DEG_TO_RAD;
+
+                if (zone.type == FieldType::Uniform)
+                {
+                    slider("Width", zone.half_size.x, 0.5f, 20.0f, 0.5f, "%.1f m");
+                    slider("Height", zone.half_size.y, 0.5f, 20.0f, 0.5f, "%.1f m");
+                }
+                else
+                {
+                    slider("Radius", zone.radius, 0.5f, 30.0f, 0.5f, "%.1f m");
+                }
+
+                slider("Strength", zone.strength, -500.0f, 500.0f, 5.0f, "%.1f m/s^2");
+                slider("Max Speed", zone.max_speed, 0.0f, 200.0f, 5.0f, "%.0f m/s");
+                slider("Arrows", zone.grid_resolution, 2, 15, 1);
+                slider("X", zone.position.x, -100.0f, 100.0f, 0.5f, "%.1f m");
+                slider("Y", zone.position.y, -40.0f, 120.0f, 0.5f, "%.1f m");
+
+                if (ImGui::Button("Remove"))
+                {
+                    g_force_zones.erase(g_force_zones.begin() + (std::ptrdiff_t)i);
+
+                    --i;
+
+                    ImGui::PopID();
+
+                    continue;
+                }
+
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+
         if (ImGui::CollapsingHeader("World"))
         {
             auto gravity = b2World_GetGravity(g_world);
@@ -936,6 +1171,23 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             ImGui::EndDisabled();
 
             slider("Sub-steps", g_sub_steps, 1, 8, 1);
+
+            auto prev_damping = g_linear_damping;
+            auto prev_random  = g_random_damping;
+            slider("Drag", g_linear_damping, 0.0f, 5.0f, 0.1f, "%.2f");
+            slider("Drag Spread", g_random_damping, 0.0f, 0.5f, 0.01f, "%.2f");
+
+            // Update all existing dynamic bodies when drag settings change.
+            if (g_linear_damping != prev_damping || g_random_damping != prev_random)
+            {
+                for (auto &&body : g_bodies)
+                {
+                    if (b2Body_GetType(body.body) == b2_dynamicBody)
+                    {
+                        b2Body_SetLinearDamping(body.body, g_linear_damping + body.damping_offset);
+                    }
+                }
+            }
         }
 
         if (ImGui::CollapsingHeader("Info", ImGuiTreeNodeFlags_DefaultOpen))
@@ -1426,13 +1678,22 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             for (auto &&rope : g_ropes)
             {
-                // Build point list: Anchor A, segment centers, anchor B.
+                // Build point list: Anchor/tip A, segment centers, anchor/tip B.
+                // At dangling ends (cut rope), use the capsule tip instead of an anchor so the visual rope covers the full collision extent.
+                // half_len (0.09) + SEG_RADIUS (0.06) = 0.15 - the capsule's hemispherical cap.
+                constexpr auto      DANGLING_TIP_OFFSET = 0.15f * 0.6f + 0.06f;
                 std::vector<b2Vec2> points{};
                 points.reserve(rope.segments.size() + 2);
 
                 if (B2_IS_NON_NULL(rope.body_a))
                 {
                     points.emplace_back(b2Body_GetWorldPoint(rope.body_a, rope.local_a));
+                }
+                else if (!rope.segments.empty())
+                {
+                    // Dangling start: Extend to the capsule tip.
+                    auto rotation = b2Body_GetRotation(rope.segments.front());
+                    points.emplace_back(b2Body_GetPosition(rope.segments.front()) + b2RotateVector(rotation, {0.0f, -DANGLING_TIP_OFFSET}));
                 }
 
                 for (auto &&segment : rope.segments)
@@ -1443,6 +1704,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 if (B2_IS_NON_NULL(rope.body_b))
                 {
                     points.emplace_back(b2Body_GetWorldPoint(rope.body_b, rope.local_b));
+                }
+                else if (!rope.segments.empty())
+                {
+                    // Dangling end: Extend to the capsule tip.
+                    auto rotation = b2Body_GetRotation(rope.segments.back());
+                    points.emplace_back(b2Body_GetPosition(rope.segments.back()) + b2RotateVector(rotation, {0.0f, DANGLING_TIP_OFFSET}));
                 }
 
                 if (points.size() < 2)
@@ -1488,10 +1755,154 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             }
         }
 
+        // Force zones.
+        for (std::size_t i{}; i < g_force_zones.size(); ++i)
+        {
+            auto &zone          = g_force_zones[i];
+            auto  screen_center = to_screen(zone.position);
+            auto  fill_color    = zone.active ? IM_COL32(80, 140, 255, 30) : IM_COL32(255, 80, 80, 20);
+            auto  border_color  = zone.active ? IM_COL32(80, 140, 255, 120) : IM_COL32(255, 80, 80, 80);
+            auto  arrow_color   = zone.active ? IM_COL32(80, 140, 255, 160) : IM_COL32(255, 80, 80, 100);
+            auto  thickness     = std::max(1.0f, 1.5f * g_cam_zoom / ZOOM_DEFAULT);
+
+            // Draw boundary.
+            if (zone.type == FieldType::Uniform)
+            {
+                auto screen_min = to_screen(zone.position - zone.half_size);
+                auto screen_max = to_screen(zone.position + zone.half_size);
+                auto rect_min   = ImVec2{std::min(screen_min.x, screen_max.x), std::min(screen_min.y, screen_max.y)};
+                auto rect_max   = ImVec2{std::max(screen_min.x, screen_max.x), std::max(screen_min.y, screen_max.y)};
+                bg->AddRectFilled(rect_min, rect_max, fill_color);
+                bg->AddRect(rect_min, rect_max, border_color, 0.0f, 0, thickness);
+            }
+            else
+            {
+                auto screen_radius = zone.radius * g_cam_zoom;
+                bg->AddCircleFilled(screen_center, screen_radius, fill_color, 48);
+                bg->AddCircle(screen_center, screen_radius, border_color, 48, thickness);
+            }
+
+            // Arrow grid: Sample field vectors on a grid and draw small arrows.
+            constexpr float ARROW_SCALE = 0.3f;
+
+            auto grid_cells    = zone.grid_resolution;
+            auto extent_x      = zone.type == FieldType::Uniform ? zone.half_size.x : zone.radius;
+            auto extent_y      = zone.type == FieldType::Uniform ? zone.half_size.y : zone.radius;
+            auto cell_x        = extent_x * 2.0f / (float)grid_cells;
+            auto cell_y        = extent_y * 2.0f / (float)grid_cells;
+            auto arrow_max_len = std::min(cell_x, cell_y) * ARROW_SCALE * g_cam_zoom;
+            for (std::int32_t gy{}; gy < grid_cells; ++gy)
+            {
+                for (std::int32_t gx{}; gx < grid_cells; ++gx)
+                {
+                    // Sample at cell center.
+                    auto   sample_x = zone.position.x - extent_x + cell_x * ((float)gx + 0.5f);
+                    auto   sample_y = zone.position.y - extent_y + cell_y * ((float)gy + 0.5f);
+                    b2Vec2 sample{sample_x, sample_y};
+
+                    // For circular types, skip samples outside the radius.
+                    if (zone.type != FieldType::Uniform)
+                    {
+                        auto delta   = sample - zone.position;
+                        auto dist_sq = b2LengthSquared(delta);
+                        if (dist_sq > zone.radius * zone.radius)
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Compute field direction at this point.
+                    b2Vec2 field_dir{};
+                    switch (zone.type)
+                    {
+                    case FieldType::Uniform:
+                    {
+                        field_dir = {std::cos(zone.angle), std::sin(zone.angle)};
+
+                        break;
+                    }
+
+                    case FieldType::Vortex:
+                    {
+                        auto delta = sample - zone.position;
+                        auto dist  = b2Length(delta);
+                        if (dist > 1e-3f)
+                        {
+                            auto inv_dist   = 1.0f / dist;
+                            auto normalized = delta * inv_dist;
+                            field_dir       = {-normalized.y, normalized.x};
+                            if (zone.strength < 0.0f)
+                            {
+                                field_dir = {normalized.y, -normalized.x};
+                            }
+                        }
+
+                        break;
+                    }
+
+                    case FieldType::RadialIn:
+                    {
+                        auto delta = sample - zone.position;
+                        auto dist  = b2Length(delta);
+                        if (dist > 1e-3f)
+                        {
+                            field_dir = delta * (-1.0f / dist);
+                        }
+
+                        break;
+                    }
+
+                    case FieldType::RadialOut:
+                    {
+                        auto delta = sample - zone.position;
+                        auto dist  = b2Length(delta);
+                        if (dist > 1e-3f)
+                        {
+                            field_dir = delta * (1.0f / dist);
+                        }
+
+                        break;
+                    }
+
+                    default:
+                    {
+                        break;
+                    }
+                    }
+
+                    // Rotate non-uniform field vectors by the zone angle.
+                    if (zone.type != FieldType::Uniform)
+                    {
+                        field_dir = b2RotateVector(b2MakeRot(zone.angle), field_dir);
+                    }
+
+                    if (b2LengthSquared(field_dir) < 0.001f)
+                    {
+                        continue;
+                    }
+
+                    // Draw arrow: Line + triangle head.
+                    auto   screen_sample = to_screen(sample);
+                    ImVec2 screen_dir{field_dir.x * arrow_max_len, -field_dir.y * arrow_max_len};
+                    auto   arrow_tip = screen_sample + screen_dir;
+                    ImVec2 arrow_perp{-screen_dir.y * 0.3f, screen_dir.x * 0.3f};
+                    auto   arrow_base = screen_sample + screen_dir * 0.55f;
+                    bg->AddLine(screen_sample, arrow_base, arrow_color, thickness);
+                    bg->AddTriangleFilled(arrow_tip, arrow_base + arrow_perp, arrow_base - arrow_perp, arrow_color);
+                }
+            }
+
+            // Label.
+            char label[24];
+            std::snprintf(label, sizeof(label), "z%zu", i);
+            auto label_pos = to_screen({zone.position.x - extent_x, zone.position.y + extent_y}) + ImVec2{4.0f, 2.0f};
+            fg->AddText(label_pos, IM_COL32(255, 255, 255, 200), label);
+        }
+
         // Emitters (on top of everything).
         for (std::size_t i{}; i < g_emitters.size(); ++i)
         {
-            auto &&emitter       = g_emitters[i];
+            auto  &emitter       = g_emitters[i];
             auto   screen_center = to_screen(emitter.position);
             auto   arrow_length  = 0.8f * g_cam_zoom;
             auto   thickness     = std::max(1.5f, 2.0f * g_cam_zoom / ZOOM_DEFAULT);
@@ -1728,7 +2139,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             {
                 // Check emitters first (small grab radius in world units).
                 constexpr auto EMITTER_GRAB_RADIUS = 0.5f;
-                for (std::int32_t i{}; i < (std::int32_t)g_emitters.size(); ++i)
+                for (std::size_t i{}; i < g_emitters.size(); ++i)
                 {
                     if (b2LengthSquared(world_point - g_emitters[i].position) <= EMITTER_GRAB_RADIUS * EMITTER_GRAB_RADIUS)
                     {
@@ -1738,8 +2149,25 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     }
                 }
 
-                // If no emitter hit, try grabbing a body.
-                if (!g_dragged_emitter)
+                // Check force zones next.
+                if (!g_dragged_emitter && !g_dragging_zone)
+                {
+                    for (std::size_t i{}; i < g_force_zones.size(); ++i)
+                    {
+                        auto &zone        = g_force_zones[i];
+                        auto  distance_sq = b2LengthSquared(world_point - zone.position);
+                        auto  grab_radius = zone.type == FieldType::Uniform ? std::max(zone.half_size.x, zone.half_size.y) : zone.radius;
+                        if (distance_sq <= grab_radius * grab_radius)
+                        {
+                            g_dragging_zone = i;
+
+                            break;
+                        }
+                    }
+                }
+
+                // If no emitter or zone hit, try grabbing a body.
+                if (!g_dragged_emitter && !g_dragging_zone)
                 {
                     g_mouse_body = find_body_at(world_point);
                     if (B2_IS_NON_NULL(g_mouse_body))
@@ -1838,7 +2266,11 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             }
             else if (g_dragged_emitter)
             {
-                g_dragged_emitter.reset();
+                g_dragged_emitter = {};
+            }
+            else if (g_dragging_zone)
+            {
+                g_dragging_zone = {};
             }
             else if (B2_IS_NON_NULL(g_mouse_joint))
             {
@@ -1868,9 +2300,10 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 g_erasing = false;
             }
             // Shift+Right was rope cut mode - already handled in motion.
-            else if (g_cutting)
+            else if (g_cutting || g_just_cut)
             {
-                g_cutting = false;
+                g_cutting  = false;
+                g_just_cut = false;
             }
             // Click, not drag: Toggle selection on body under cursor.
             else if (drag.x * drag.x + drag.y * drag.y < 25.0f)
@@ -1959,6 +2392,11 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             auto world_point                        = screen_to_world(event->motion.x, event->motion.y);
             g_emitters[*g_dragged_emitter].position = world_point;
         }
+        else if (g_dragging_zone)
+        {
+            auto world_point                         = screen_to_world(event->motion.x, event->motion.y);
+            g_force_zones[*g_dragging_zone].position = world_point;
+        }
         else if (B2_IS_NON_NULL(g_mouse_joint))
         {
             auto world_point = screen_to_world(event->motion.x, event->motion.y);
@@ -2016,7 +2454,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             // Erase ropes: Hit-test cursor against rope links, destroy entire rope on hit.
             for (std::size_t i{}; i < g_ropes.size(); ++i)
             {
-                auto &&rope = g_ropes[i];
+                auto &rope = g_ropes[i];
 
                 std::vector<b2Vec2> points{};
                 points.reserve(rope.segments.size() + 2);
@@ -2238,6 +2676,12 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
                 --i;
                 --rope_count;
+
+                // One cut per drag. `g_just_cut` suppresses selection on release.
+                g_cutting  = false;
+                g_just_cut = true;
+
+                break;
             }
         }
         else if (!g_current_stroke.empty())

@@ -39,7 +39,7 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 | SDL3 | 3.4.2 | Window, input, SDL_Renderer |
 | Dear ImGui | 1.92.6-docking | UI, draw lists (all rendering goes through ImGui) |
 | Box2D | 3.1.1 | Rigid body physics (v3 C API, AVX2 optional via PHYS_AVX2) |
-| FreeType | 2.14.1 | Font rasterization for ImGui |
+| FreeType | 2.14.2 | Font rasterization for ImGui |
 | dp::thread-pool | 0.7.0 | Worker threads shared with Box2D task system |
 
 ## Architecture
