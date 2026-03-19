@@ -60,6 +60,8 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - `std::int32_t` / `std::uint32_t` / `std::size_t` — no bare `int` for sizes or counts.
 - Globals prefixed `g_`. Constants are `UPPER_SNAKE_CASE`.
 - Includes: third-party first, then stdlib, not sorted by clang-format (`SortIncludes: Never`).
+- `noexcept` on pure-computation functions/lambdas. `[[nodiscard]]` on non-void free functions.
+- `slider()` / `combo()` wrappers (with `scroll_adjust`) instead of raw ImGui widget calls.
 
 ## Key globals
 
@@ -102,11 +104,12 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - All coordinate transforms go through `screen_to_world()` or the `to_screen` lambda in the render block.
 - Kill bounds: `AREA_MIN/MAX ± 5m` — tied to world bounds, not viewport. Bodies destroyed just past the world edge.
 
+- Rope segments are capsules (radius 0.06, spacing 0.15) connected by revolute joints at capsule tips. Capsules extend to 60% of spacing for overlap.
 - Rope cleanup: prune ropes with dead anchors each frame, destroy orphaned segment bodies + joints.
-- Rope cutting (Shift+Right drag): destroys all joints, splits segments into two half-ropes re-wired at current separations. `wire_half` guards null anchors (dangling ends get no anchor joint or filter joints).
+- Rope cutting (Shift+Right drag): destroys all joints, splits segments into two half-ropes re-wired with revolute joints. `wire_half` guards null anchors (dangling ends get no anchor joint or filter joints).
 - Rope erasing (Ctrl+Right drag): hit-tests cursor against rope links, destroys entire rope (all joints + segment bodies).
 - Pin cleanup: prune invalid joints each frame.
 - Pin/unpin actions set `g_just_pinned` to suppress right-click-up selection toggle.
 - All range-for loops use `auto &&`.
 - Use Box2D math builtins (`b2Dot`, `b2Lerp`, `b2NLerp`, `b2Normalize`, etc.) over custom wrappers.
-- Variable naming: `dist_def`, `rev_def`, `mouse_def`, `filter_def_a/b` for joint defs. No single-letter names except standard math (`t`, `r`, `d`).
+- Variable naming: `dist_def`, `rev_def`, `mouse_def`, `filter_def_a/b` for joint defs. `position`/`rotation` not `pos`/`rot`. No single-letter names except standard math (`t`).

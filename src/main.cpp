@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <concepts>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -130,7 +131,7 @@ struct Emitter
     float      speed = 15.0f; // m/s.
     float      rate  = 3.0f;  // Bodies per second.
     float      timer{};
-    SpawnShape shape = SpawnShape::Count;
+    SpawnShape shape = SpawnShape::Box;
     bool       active{};
 };
 
@@ -358,7 +359,61 @@ void delete_selected()
         }
     }
 
-    std::erase_if(g_bodies, [](const PhysBody &body) { return body.selected; });
+    std::erase_if(g_bodies, [](const PhysBody &body) noexcept { return body.selected; });
+}
+
+// Adjust a value by mouse wheel or +/- keys when the last ImGui item is hovered.
+template <class T>
+requires (std::integral<T> || std::floating_point<T>) void scroll_adjust(T &value, T step, T min_val, T max_val) noexcept
+{
+    if (!ImGui::IsItemHovered())
+    {
+        return;
+    }
+
+    auto wheel = ImGui::GetIO().MouseWheel;
+    if (wheel != 0.0f)
+    {
+        value = std::clamp(value + (T)(wheel * (float)step), min_val, max_val);
+
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd))
+    {
+        value = std::clamp(value + step, min_val, max_val);
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract))
+    {
+        value = std::clamp(value - step, min_val, max_val);
+    }
+}
+
+// `SliderFloat`/`SliderInt` + scroll_adjust in one call.
+bool slider(const char *label, float &value, float min_val, float max_val, float scroll_step, const char *fmt = "%.3f") noexcept
+{
+    auto result = ImGui::SliderFloat(label, &value, min_val, max_val, fmt);
+    scroll_adjust(value, scroll_step, min_val, max_val);
+
+    return result;
+}
+
+bool slider(const char *label, int &value, int min_val, int max_val, int scroll_step, const char *fmt = "%d") noexcept
+{
+    auto result = ImGui::SliderInt(label, &value, min_val, max_val, fmt);
+    scroll_adjust(value, scroll_step, min_val, max_val);
+
+    return result;
+}
+
+// Combo (null-separated items) + scroll_adjust in one call.
+bool combo(const char *label, int &index, const char *items_separated_by_zeros, int item_count) noexcept
+{
+    auto result = ImGui::Combo(label, &index, items_separated_by_zeros);
+    scroll_adjust(index, 1, 0, item_count - 1);
+
+    return result;
 }
 
 void tick_emitters(float dt)
@@ -701,11 +756,11 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         g_bodies,
         [](const PhysBody &body)
         {
-            auto pos = b2Body_GetPosition(body.body);
-            if (pos.x < AREA_MIN_X - KILL_MARGIN
-                || pos.x > AREA_MAX_X + KILL_MARGIN
-                || pos.y < AREA_MIN_Y - KILL_MARGIN
-                || pos.y > AREA_MAX_Y + KILL_MARGIN)
+            auto position = b2Body_GetPosition(body.body);
+            if (position.x < AREA_MIN_X - KILL_MARGIN
+                || position.x > AREA_MAX_X + KILL_MARGIN
+                || position.y < AREA_MIN_Y - KILL_MARGIN
+                || position.y > AREA_MAX_Y + KILL_MARGIN)
             {
                 // Release mouse joint if we're about to destroy the dragged body.
                 if (B2_IS_NON_NULL(g_mouse_joint) && body.body.index1 == g_mouse_body.index1)
@@ -823,22 +878,20 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
                 ImGui::Checkbox("##active", &emitter.active);
                 ImGui::SameLine();
-                ImGui::Text("Emitter %zu", i);
+                ImGui::Text("Emitter (e%zu)", i);
 
                 auto angle_deg = emitter.angle * RAD_TO_DEG;
-                if (ImGui::SliderFloat("Angle", &angle_deg, -180.0f, 180.0f, "%.0f deg"))
-                {
-                    emitter.angle = angle_deg * DEG_TO_RAD;
-                }
+                slider("Angle", angle_deg, -180.0f, 180.0f, 5.0f, "%.0f deg");
 
-                ImGui::SliderFloat("Speed", &emitter.speed, 1.0f, 50.0f, "%.1f m/s");
-                ImGui::SliderFloat("Rate", &emitter.rate, 0.5f, 20.0f, "%.1f /s");
+                emitter.angle = angle_deg * DEG_TO_RAD;
 
-                auto shape_idx = (int)emitter.shape;
-                if (ImGui::Combo("Shape", &shape_idx, "Box\0Circle\0Triangle\0"))
-                {
-                    emitter.shape = (SpawnShape)shape_idx;
-                }
+                slider("Speed", emitter.speed, 1.0f, 50.0f, 1.0f, "%.1f m/s");
+                slider("Rate", emitter.rate, 0.5f, 20.0f, 0.5f, "%.1f /s");
+
+                int shape_idx = (int)emitter.shape;
+                combo("Shape", shape_idx, "Box\0Circle\0Triangle\0", (int)SpawnShape::Count);
+
+                emitter.shape = (SpawnShape)shape_idx;
 
                 if (ImGui::Button("Remove"))
                 {
@@ -859,10 +912,9 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         if (ImGui::CollapsingHeader("World"))
         {
             auto gravity = b2World_GetGravity(g_world);
-            if (ImGui::SliderFloat("Gravity", &gravity.y, -50.0f, 50.0f, "%.1f m/s^2"))
-            {
-                b2World_SetGravity(g_world, gravity);
-            }
+            slider("Gravity", gravity.y, -50.0f, 50.0f, 1.0f, "%.1f m/s^2");
+
+            b2World_SetGravity(g_world, gravity);
 
             auto sleeping = b2World_IsSleepingEnabled(g_world);
             if (ImGui::Checkbox("Sleeping", &sleeping))
@@ -879,9 +931,11 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 g_single_step = true;
             }
 
-            ImGui::SliderInt("Step count", &g_step_count, 1, 100);
+            slider("Step count", g_step_count, 1, 100, 1);
+
             ImGui::EndDisabled();
-            ImGui::SliderInt("Sub-steps", &g_sub_steps, 1, 8);
+
+            slider("Sub-steps", g_sub_steps, 1, 8, 1);
         }
 
         if (ImGui::CollapsingHeader("Info", ImGuiTreeNodeFlags_DefaultOpen))
@@ -904,16 +958,16 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         if (ImGui::CollapsingHeader("Graphics"))
         {
             // VSync mode: Maps combo index to SDL vsync values.
-            constexpr int vsync_values[] = {SDL_RENDERER_VSYNC_DISABLED, 1, SDL_RENDERER_VSYNC_ADAPTIVE};
-            const char   *vsync_labels[] = {"Off", "On", "Adaptive"};
-            int           vsync_index    = g_vsync == SDL_RENDERER_VSYNC_ADAPTIVE ? 2 : g_vsync;
-            if (ImGui::Combo("VSync", &vsync_index, vsync_labels, 3))
-            {
-                g_vsync = vsync_values[vsync_index];
-                SDL_SetRenderVSync(g_renderer, g_vsync);
-            }
+            constexpr int VSYNC_VALUES[] = {SDL_RENDERER_VSYNC_DISABLED, 1, SDL_RENDERER_VSYNC_ADAPTIVE};
 
-            ImGui::SliderInt("FPS Cap", &g_fps_cap, 0, 1000, g_fps_cap == 0 ? "Off" : "%d");
+            int vsync_index = g_vsync == SDL_RENDERER_VSYNC_ADAPTIVE ? 2 : g_vsync;
+            combo("VSync", vsync_index, "Off\0On\0Adaptive\0", 3);
+
+            g_vsync = VSYNC_VALUES[vsync_index];
+            SDL_SetRenderVSync(g_renderer, g_vsync);
+
+            slider("FPS Cap", g_fps_cap, 0, 1000, 10, g_fps_cap == 0 ? "Off" : "%d");
+
             if (g_fps_cap > 0)
             {
                 g_fps_cap = std::clamp(g_fps_cap, 10, 1000);
@@ -1061,7 +1115,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         auto to_screen = [cam_x, cam_y](b2Vec2 point) noexcept -> ImVec2 { return {cam_x + point.x * g_cam_zoom, cam_y - point.y * g_cam_zoom}; };
 
         // Render a polygon shape with its radius expansion.
-        auto render_poly = [to_screen, bg](b2Vec2 pos, b2Rot rot, const b2Polygon &poly, ImU32 color, bool show_edge = true)
+        auto render_poly = [to_screen, bg](b2Vec2 position, b2Rot rotation, const b2Polygon &poly, ImU32 color, bool show_edge = true) noexcept
         {
             constexpr auto BORDER_PX = 1.5f;
 
@@ -1080,7 +1134,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 auto outer_offset = bisect_dot > 0.0f ? radius / bisect_dot : radius;
                 auto outer_local  = poly.vertices[i] + bisect * outer_offset;
 
-                screen[i] = to_screen(b2RotateVector(rot, outer_local) + pos);
+                screen[i] = to_screen(b2RotateVector(rotation, outer_local) + position);
 
                 // Inset vertex: Same bisector, reduced offset. Gives uniform border_world inset per edge.
                 if (show_edge)
@@ -1089,7 +1143,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     auto inner_offset = bisect_dot > 0.0f ? inner_radius / bisect_dot : inner_radius;
                     auto inner_local  = poly.vertices[i] + bisect * inner_offset;
 
-                    inset[i] = to_screen(b2RotateVector(rot, inner_local) + pos);
+                    inset[i] = to_screen(b2RotateVector(rotation, inner_local) + position);
                 }
             }
 
@@ -1169,24 +1223,24 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         for (auto &&body : g_bodies)
         {
             // Not sleeping.
-            b2Vec2 pos;
-            b2Rot  rot;
+            b2Vec2 position;
+            b2Rot  rotation;
             if (b2Body_IsAwake(body.body))
             {
                 auto transform = b2Body_GetTransform(body.body);
-                pos            = b2Lerp(body.prev.position, transform.p, alpha);
-                rot            = b2NLerp(body.prev.rotation, transform.q, alpha);
+                position       = b2Lerp(body.prev.position, transform.p, alpha);
+                rotation       = b2NLerp(body.prev.rotation, transform.q, alpha);
             }
             // Sleeping: Current transform is stable, no interpolation needed.
             else
             {
                 auto transform = b2Body_GetTransform(body.body);
-                pos            = transform.p;
-                rot            = transform.q;
+                position       = transform.p;
+                rotation       = transform.q;
             }
 
             // Frustum cull.
-            if (pos.x < view_min.x || pos.x > view_max.x || pos.y < view_min.y || pos.y > view_max.y)
+            if (position.x < view_min.x || position.x > view_max.x || position.y < view_min.y || position.y > view_max.y)
             {
                 ++g_culled_count;
 
@@ -1203,10 +1257,10 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 if (type == b2_polygonShape)
                 {
                     auto poly  = b2Shape_GetPolygon(body.shape);
-                    auto min_x = pos.x, min_y = pos.y, max_x = pos.x, max_y = pos.y;
+                    auto min_x = position.x, min_y = position.y, max_x = position.x, max_y = position.y;
                     for (std::int32_t j{}; j < poly.count; ++j)
                     {
-                        auto world = b2RotateVector(rot, poly.vertices[j]) + pos;
+                        auto world = b2RotateVector(rotation, poly.vertices[j]) + position;
                         min_x      = std::min(min_x, world.x);
                         min_y      = std::min(min_y, world.y);
                         max_x      = std::max(max_x, world.x);
@@ -1218,7 +1272,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 else if (type == b2_circleShape)
                 {
                     auto circle = b2Shape_GetCircle(body.shape);
-                    auto center = b2RotateVector(rot, circle.center) + pos;
+                    auto center = b2RotateVector(rotation, circle.center) + position;
                     body_aabb   = {{center.x - circle.radius, center.y - circle.radius}, {center.x + circle.radius, center.y + circle.radius}};
                 }
 
@@ -1237,7 +1291,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     fill_color = poly.count == 3 ? IM_COL32(50, 200, 50, 255) : IM_COL32(51, 153, 230, 255);
                 }
 
-                render_poly(pos, rot, b2Shape_GetPolygon(body.shape), fill_color, outline_enabled);
+                render_poly(position, rotation, b2Shape_GetPolygon(body.shape), fill_color, outline_enabled);
             }
             else if (type == b2_circleShape)
             {
@@ -1247,7 +1301,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 }
 
                 auto circle        = b2Shape_GetCircle(body.shape);
-                auto world_center  = b2RotateVector(rot, circle.center) + pos;
+                auto world_center  = b2RotateVector(rotation, circle.center) + position;
                 auto screen_center = to_screen(world_center);
                 auto screen_radius = circle.radius * g_cam_zoom;
                 if (outline_enabled)
@@ -1257,7 +1311,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     bg->AddCircleFilled(screen_center, screen_radius - 1.5f, fill_color);
 
                     auto   inset_radius = screen_radius - 1.5f;
-                    ImVec2 edge{screen_center.x + rot.c * inset_radius, screen_center.y - rot.s * inset_radius};
+                    ImVec2 edge{screen_center.x + rotation.c * inset_radius, screen_center.y - rotation.s * inset_radius};
                     bg->AddLine(screen_center, edge, edge_color, std::max(2.0f, 3.0f * g_cam_zoom / ZOOM_DEFAULT));
                 }
                 else
@@ -1268,7 +1322,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         }
 
         // Drawn lines (on top of bodies).
-        auto render_smooth_line = [to_screen, bg](const std::vector<b2Vec2> &points, ImU32 color, float thickness)
+        auto render_smooth_line = [to_screen, bg](const std::vector<b2Vec2> &points, ImU32 color, float thickness) noexcept
         {
             if (points.size() < 2)
             {
@@ -1286,15 +1340,37 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             for (std::size_t i{}; i < points.size() - 1; ++i)
             {
-                auto p0 = points[i > 0 ? i - 1 : 0];
-                auto p1 = points[i];
-                auto p2 = points[i + 1];
-                auto p3 = points[i + 1 < points.size() - 1 ? i + 2 : points.size() - 1];
-                auto b1 = to_screen(p1 + (p2 - p0) * (1.0f / 6.0f));
-                auto b2 = to_screen(p2 - (p3 - p1) * (1.0f / 6.0f));
-                auto b3 = to_screen(p2);
+                auto prev  = points[i > 0 ? i - 1 : 0];
+                auto curr  = points[i];
+                auto next  = points[i + 1];
+                auto after = points[i + 1 < points.size() - 1 ? i + 2 : points.size() - 1];
 
-                bg->PathBezierCubicCurveTo(b1, b2, b3);
+                // Catmull-Rom tangents, clamped to prevent overshoot at endpoints and sharp angles.
+                auto segment_length = b2Length(next - curr);
+                auto prev_length    = i > 0 ? b2Length(curr - prev) : segment_length;
+                auto max_tangent    = std::min(segment_length, prev_length) * 0.5f;
+                auto tangent_start  = (next - prev) * (1.0f / 6.0f);
+                auto tangent_end    = (after - curr) * (1.0f / 6.0f);
+
+                auto tangent_start_length = b2Length(tangent_start);
+                if (tangent_start_length > max_tangent)
+                {
+                    tangent_start = tangent_start * (max_tangent / tangent_start_length);
+                }
+
+                auto next_length        = i + 1 < points.size() - 1 ? b2Length(after - next) : segment_length;
+                auto max_tangent_end    = std::min(segment_length, next_length) * 0.5f;
+                auto tangent_end_length = b2Length(tangent_end);
+                if (tangent_end_length > max_tangent_end)
+                {
+                    tangent_end = tangent_end * (max_tangent_end / tangent_end_length);
+                }
+
+                auto ctrl1 = to_screen(curr + tangent_start);
+                auto ctrl2 = to_screen(next - tangent_end);
+                auto end   = to_screen(next);
+
+                bg->PathBezierCubicCurveTo(ctrl1, ctrl2, end);
             }
 
             bg->PathStroke(color, 0, thickness);
@@ -1337,11 +1413,11 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                         }
                     }
 
-                    for (auto &&seg : rope.segments)
+                    for (auto &&segment : rope.segments)
                     {
-                        if (b2Body_IsValid(seg))
+                        if (b2Body_IsValid(segment))
                         {
-                            b2DestroyBody(seg);
+                            b2DestroyBody(segment);
                         }
                     }
 
@@ -1350,7 +1426,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             for (auto &&rope : g_ropes)
             {
-                // Build point list: Anchor A (if present), segment centers, anchor B (if present).
+                // Build point list: Anchor A, segment centers, anchor B.
                 std::vector<b2Vec2> points{};
                 points.reserve(rope.segments.size() + 2);
 
@@ -1379,7 +1455,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 render_smooth_line(points, ROPE_COLOR, rope_thickness);
             }
 
-            // Pending rope: line from start anchor to cursor.
+            // Pending rope: Line from start anchor to cursor.
             if (B2_IS_NON_NULL(g_rope_start_body))
             {
                 auto world_a      = b2Body_GetWorldPoint(g_rope_start_body, g_rope_start_anchor);
@@ -1391,7 +1467,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
         // Pins.
         {
-            std::erase_if(g_pins, [](const Pin &pin) { return !b2Joint_IsValid(pin.joint); });
+            std::erase_if(g_pins, [](const Pin &pin) noexcept { return !b2Joint_IsValid(pin.joint); });
 
             auto zoom_ratio = g_cam_zoom / ZOOM_DEFAULT;
             auto radius     = std::clamp(8.0f * std::sqrt(zoom_ratio), 4.0f, 20.0f);
@@ -1417,12 +1493,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         {
             auto &&emitter       = g_emitters[i];
             auto   screen_center = to_screen(emitter.position);
-            auto   len           = 0.8f * g_cam_zoom;
+            auto   arrow_length  = 0.8f * g_cam_zoom;
             auto   thickness     = std::max(1.5f, 2.0f * g_cam_zoom / ZOOM_DEFAULT);
-            ImVec2 dir{std::cos(emitter.angle) * len, -std::sin(emitter.angle) * len};
-            auto   tip = screen_center + dir;
-            ImVec2 perp{-dir.y * 0.2f, dir.x * 0.2f};
-            auto   base = screen_center + dir * 0.65f;
+            ImVec2 arrow_dir{std::cos(emitter.angle) * arrow_length, -std::sin(emitter.angle) * arrow_length};
+            auto   tip = screen_center + arrow_dir;
+            ImVec2 perp{-arrow_dir.y * 0.2f, arrow_dir.x * 0.2f};
+            auto   base = screen_center + arrow_dir * 0.65f;
 
             auto color = emitter.active ? IM_COL32(100, 255, 100, 255) : IM_COL32(255, 100, 100, 255);
             bg->AddLine(screen_center, base, color, thickness);
@@ -1452,8 +1528,8 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
     SDL_SetRenderScale(g_renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
 
-    constexpr ImVec4 clear_color(0.10f, 0.10f, 0.10f, 1.00f);
-    SDL_SetRenderDrawColorFloat(g_renderer, clear_color.x, clear_color.y, clear_color.z, clear_color.w);
+    constexpr ImVec4 CLEAR_COLOR(0.10f, 0.10f, 0.10f, 1.00f);
+    SDL_SetRenderDrawColorFloat(g_renderer, CLEAR_COLOR.x, CLEAR_COLOR.y, CLEAR_COLOR.z, CLEAR_COLOR.w);
 
     SDL_RenderClear(g_renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(draw_data, g_renderer);
@@ -1532,8 +1608,9 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                         // Second click: Create rope chain between the two bodies.
                         if (hit.index1 != g_rope_start_body.index1)
                         {
-                            constexpr auto SEG_RADIUS  = 0.12f;
-                            constexpr auto SEG_SPACING = 0.18f; // < 2*SEG_RADIUS so segments overlap.
+                            constexpr auto SEG_RADIUS  = 0.06f;
+                            constexpr auto SEG_SPACING = 0.15f;
+                            auto           half_len    = SEG_SPACING * 0.6f; // > 0.5 so adjacent capsules overlap.
 
                             auto anchor_b  = b2Body_GetLocalPoint(hit, world_point);
                             auto world_a   = b2Body_GetWorldPoint(g_rope_start_body, g_rope_start_anchor);
@@ -1552,81 +1629,72 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                             shape_def.density           = 0.5f;
                             shape_def.material.friction = 0.6f;
 
-                            b2Circle circle{b2Vec2_zero, SEG_RADIUS};
-                            Rope     rope{};
+                            // Capsule: Pill shape aligned vertically, tips at +/- half_len.
+                            b2Capsule capsule{{0.0f, -half_len}, {0.0f, half_len}, SEG_RADIUS};
+
+                            // Orient all capsules along the rope direction.
+                            auto rope_dir     = b2Normalize(world_b - world_a);
+                            body_def.rotation = b2MakeRot(std::atan2(rope_dir.y, rope_dir.x) - PI / 2.0f);
+
+                            Rope rope{};
                             for (std::int32_t i{}; i < seg_count; ++i)
                             {
                                 auto t            = (float)(i + 1) / (float)(seg_count + 1);
-                                auto pos          = b2Lerp(world_a, world_b, t);
-                                body_def.position = pos;
+                                body_def.position = b2Lerp(world_a, world_b, t);
 
-                                auto seg = b2CreateBody(g_world, &body_def);
-                                b2CreateCircleShape(seg, &shape_def, &circle);
+                                auto segment = b2CreateBody(g_world, &body_def);
+                                b2CreateCapsuleShape(segment, &shape_def, &capsule);
 
-                                rope.segments.emplace_back(seg);
+                                rope.segments.emplace_back(segment);
                             }
 
-                            // Compute per-link length from actual placement.
-                            auto link_len = dist / (float)(seg_count + 1);
-
-                            // Connect anchor A -> first segment.
+                            // Revolute joints: Connect capsule tips end-to-end.
+                            // Anchor A -> First segment bottom tip.
                             {
-                                auto dist_def         = b2DefaultDistanceJointDef();
-                                dist_def.bodyIdA      = g_rope_start_body;
-                                dist_def.bodyIdB      = rope.segments.front();
-                                dist_def.localAnchorA = g_rope_start_anchor;
-                                dist_def.localAnchorB = b2Vec2_zero;
-                                dist_def.length       = link_len;
-                                dist_def.enableLimit  = true;
-                                dist_def.minLength    = link_len * 0.05f;
-                                dist_def.maxLength    = link_len;
+                                auto rev_def         = b2DefaultRevoluteJointDef();
+                                rev_def.bodyIdA      = g_rope_start_body;
+                                rev_def.bodyIdB      = rope.segments.front();
+                                rev_def.localAnchorA = g_rope_start_anchor;
+                                rev_def.localAnchorB = {0.0f, -half_len};
 
-                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &dist_def));
+                                rope.joints.emplace_back(b2CreateRevoluteJoint(g_world, &rev_def));
                             }
 
-                            // Connect segments to each other.
+                            // Segment-to-segment: Top tip of [i] -> bottom tip of [i+1].
                             for (std::int32_t i{}; i < seg_count - 1; ++i)
                             {
-                                auto dist_def         = b2DefaultDistanceJointDef();
-                                dist_def.bodyIdA      = rope.segments[i];
-                                dist_def.bodyIdB      = rope.segments[i + 1];
-                                dist_def.localAnchorA = b2Vec2_zero;
-                                dist_def.localAnchorB = b2Vec2_zero;
-                                dist_def.length       = link_len;
-                                dist_def.enableLimit  = true;
-                                dist_def.minLength    = link_len * 0.05f;
-                                dist_def.maxLength    = link_len;
+                                auto rev_def         = b2DefaultRevoluteJointDef();
+                                rev_def.bodyIdA      = rope.segments[i];
+                                rev_def.bodyIdB      = rope.segments[i + 1];
+                                rev_def.localAnchorA = {0.0f, half_len};
+                                rev_def.localAnchorB = {0.0f, -half_len};
 
-                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &dist_def));
+                                rope.joints.emplace_back(b2CreateRevoluteJoint(g_world, &rev_def));
                             }
 
-                            // Connect last segment -> anchor B.
+                            // Last segment top tip -> Anchor B.
                             {
-                                auto dist_def         = b2DefaultDistanceJointDef();
-                                dist_def.bodyIdA      = rope.segments.back();
-                                dist_def.bodyIdB      = hit;
-                                dist_def.localAnchorA = b2Vec2_zero;
-                                dist_def.localAnchorB = anchor_b;
-                                dist_def.length       = link_len;
-                                dist_def.enableLimit  = true;
-                                dist_def.minLength    = link_len * 0.05f;
-                                dist_def.maxLength    = link_len;
+                                auto rev_def         = b2DefaultRevoluteJointDef();
+                                rev_def.bodyIdA      = rope.segments.back();
+                                rev_def.bodyIdB      = hit;
+                                rev_def.localAnchorA = {0.0f, half_len};
+                                rev_def.localAnchorB = anchor_b;
 
-                                rope.joints.emplace_back(b2CreateDistanceJoint(g_world, &dist_def));
+                                rope.joints.emplace_back(b2CreateRevoluteJoint(g_world, &rev_def));
                             }
 
                             // Disable collision between rope segments and their anchor bodies.
-                            for (auto &&seg : rope.segments)
+                            for (auto &&segment : rope.segments)
                             {
                                 auto filter_def_a    = b2DefaultFilterJointDef();
                                 filter_def_a.bodyIdA = g_rope_start_body;
-                                filter_def_a.bodyIdB = seg;
+                                filter_def_a.bodyIdB = segment;
 
                                 rope.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_a));
 
                                 auto filter_def_b    = b2DefaultFilterJointDef();
                                 filter_def_b.bodyIdA = hit;
-                                filter_def_b.bodyIdB = seg;
+                                filter_def_b.bodyIdB = segment;
 
                                 rope.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_b));
                             }
@@ -1697,14 +1765,14 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
         // Right-click.
         else if (event->button.button == SDL_BUTTON_RIGHT)
         {
-            // Right-click while dragging: pin body at current position.
+            // Right-click while dragging: Pin body at current position.
             if (B2_IS_NON_NULL(g_mouse_joint))
             {
-                auto pos             = b2Body_GetPosition(g_mouse_body);
+                auto position        = b2Body_GetPosition(g_mouse_body);
                 auto rev_def         = b2DefaultRevoluteJointDef();
                 rev_def.bodyIdA      = g_ground_id;
                 rev_def.bodyIdB      = g_mouse_body;
-                rev_def.localAnchorA = b2Body_GetLocalPoint(g_ground_id, pos);
+                rev_def.localAnchorA = b2Body_GetLocalPoint(g_ground_id, position);
                 rev_def.localAnchorB = b2Vec2_zero;
 
                 g_pins.emplace_back(b2CreateRevoluteJoint(g_world, &rev_def), g_mouse_body);
@@ -1724,21 +1792,23 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
             }
             else if ((SDL_GetModState() & SDL_KMOD_CTRL) != 0)
             {
-                // Ctrl+Right-click on a pinned body: unpin it.
+                // Ctrl+Right-click on a pinned body: Unpin it.
                 auto world_point = screen_to_world(event->button.x, event->button.y);
                 auto hit_body    = find_body_at(world_point);
-                auto pin_it = std::find_if(g_pins.begin(), g_pins.end(), [hit_body](const Pin &pin) { return B2_ID_EQUALS(pin.body, hit_body); });
+                auto pin_it =
+                    std::find_if(g_pins.begin(), g_pins.end(), [hit_body](const Pin &pin) noexcept { return B2_ID_EQUALS(pin.body, hit_body); });
                 if (B2_IS_NON_NULL(hit_body) && pin_it != g_pins.end())
                 {
                     b2DestroyJoint(pin_it->joint);
 
                     g_pins.erase(pin_it);
 
-                    g_just_pinned = true; // Suppress right-click-up selection.
+                    // Suppress right-click-up selection.
+                    g_just_pinned = true;
                 }
                 else
                 {
-                    // No pin under cursor: start erasing.
+                    // No pin under cursor: Start erasing.
                     g_erasing = true;
                 }
             }
@@ -1821,7 +1891,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 }
                 else
                 {
-                    // Clicked empty space: clear selection.
+                    // Clicked empty space: Clear selection.
                     for (auto &&body : g_bodies)
                     {
                         body.selected = false;
@@ -1943,7 +2013,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 --i;
             }
 
-            // Erase ropes: hit-test cursor against rope links, destroy entire rope on hit.
+            // Erase ropes: Hit-test cursor against rope links, destroy entire rope on hit.
             for (std::size_t i{}; i < g_ropes.size(); ++i)
             {
                 auto &&rope = g_ropes[i];
@@ -2035,9 +2105,9 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     points.emplace_back(b2Body_GetWorldPoint(body_a, anchor_a));
                 }
 
-                for (auto &&seg : rope.segments)
+                for (auto &&segment : rope.segments)
                 {
-                    points.emplace_back(b2Body_GetPosition(seg));
+                    points.emplace_back(b2Body_GetPosition(segment));
                 }
 
                 if (has_b)
@@ -2078,33 +2148,28 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
                 // Map hit_link in points[] to a segment-space cut index.
                 // points: [anchor_a?] [seg_0 .. seg_(N-1)] [anchor_b?]
-                // cut_seg = first segment on the right side of the cut.
+                // `cut_seg` = First segment on the right side of the cut.
                 auto cut_seg     = has_a ? *hit_link : *hit_link + 1;
                 auto left_count  = cut_seg;
                 auto right_count = seg_count - cut_seg;
 
-                // Helper: Create a distance joint at the current separation.
-                auto make_dist = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to)
-                {
-                    auto world_from       = b2Body_GetWorldPoint(body_from, local_from);
-                    auto world_to         = b2Body_GetWorldPoint(body_to, local_to);
-                    auto length           = std::max(0.01f, b2Length(world_to - world_from));
-                    auto dist_def         = b2DefaultDistanceJointDef();
-                    dist_def.bodyIdA      = body_from;
-                    dist_def.bodyIdB      = body_to;
-                    dist_def.localAnchorA = local_from;
-                    dist_def.localAnchorB = local_to;
-                    dist_def.length       = length;
-                    dist_def.enableLimit  = true;
-                    dist_def.minLength    = length * 0.05f;
-                    dist_def.maxLength    = length;
+                constexpr auto HALF_LEN = 0.15f * 0.5f;
 
-                    return b2CreateDistanceJoint(g_world, &dist_def);
+                // Helper: Create a revolute joint between two bodies.
+                auto make_rev = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to)
+                {
+                    auto rev_def         = b2DefaultRevoluteJointDef();
+                    rev_def.bodyIdA      = body_from;
+                    rev_def.bodyIdB      = body_to;
+                    rev_def.localAnchorA = local_from;
+                    rev_def.localAnchorB = local_to;
+
+                    return b2CreateRevoluteJoint(g_world, &rev_def);
                 };
 
                 // Wire a sub-rope from existing segment bodies and push to g_ropes.
                 // `anchor_first`: true = `anchor` is `body_a` (left half), false = `body_b` (right half).
-                auto wire_half = [&make_dist](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segs, std::int32_t count, bool anchor_first)
+                auto wire_half = [&make_rev](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segs, std::int32_t count, bool anchor_first)
                 {
                     Rope half{};
                     half.segments.assign(segs, segs + count);
@@ -2117,26 +2182,26 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                         {
                             half.body_a  = anchor;
                             half.local_a = anchor_local;
-                            half.joints.emplace_back(make_dist(anchor, anchor_local, half.segments.front(), b2Vec2_zero));
+                            half.joints.emplace_back(make_rev(anchor, anchor_local, half.segments.front(), {0.0f, -HALF_LEN}));
                         }
 
                         for (std::int32_t j{}; j < count - 1; ++j)
                         {
-                            half.joints.emplace_back(make_dist(half.segments[j], b2Vec2_zero, half.segments[j + 1], b2Vec2_zero));
+                            half.joints.emplace_back(make_rev(half.segments[j], {0.0f, HALF_LEN}, half.segments[j + 1], {0.0f, -HALF_LEN}));
                         }
                     }
                     else
                     {
                         for (std::int32_t j{}; j < count - 1; ++j)
                         {
-                            half.joints.emplace_back(make_dist(half.segments[j], b2Vec2_zero, half.segments[j + 1], b2Vec2_zero));
+                            half.joints.emplace_back(make_rev(half.segments[j], {0.0f, HALF_LEN}, half.segments[j + 1], {0.0f, -HALF_LEN}));
                         }
 
                         if (has_anchor)
                         {
                             half.body_b  = anchor;
                             half.local_b = anchor_local;
-                            half.joints.emplace_back(make_dist(half.segments.back(), b2Vec2_zero, anchor, anchor_local));
+                            half.joints.emplace_back(make_rev(half.segments.back(), {0.0f, HALF_LEN}, anchor, anchor_local));
                         }
                     }
 
