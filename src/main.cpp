@@ -1,3 +1,4 @@
+#include <scope_guard.hpp>
 #include <thread_pool/thread_pool.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -7,9 +8,11 @@
 #include <box2d/box2d.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <concepts>
+#include <charconv>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -18,7 +21,10 @@
 #include <memory>
 #include <new>
 #include <numbers>
+#include <numeric>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -50,36 +56,38 @@ constexpr auto AREA_MIN_Y = -40.0f;
 constexpr auto AREA_MAX_Y = 120.0f;
 
 // Window / renderer.
-float         g_dpi_scaling{};
-int           g_window_w{};
-int           g_window_h{};
-SDL_Window   *g_window{};
-SDL_Renderer *g_renderer{};
-const char   *g_renderer_name{};
+float         g_dpi_scaling{};   // OS display scale factor.
+int           g_window_w{};      // Window width in pixels.
+int           g_window_h{};      // Window height in pixels.
+SDL_Window   *g_window{};        // Main application window.
+SDL_Renderer *g_renderer{};      // SDL GPU renderer.
+const char   *g_renderer_name{}; // Name of the active GPU renderer backend.
 
 // Threading.
-std::uint32_t                      g_worker_count{};
-std::unique_ptr<dp::thread_pool<>> g_thread_pool{};
-std::atomic<std::uint32_t>         g_next_worker{};
-std::int32_t                       g_task_count{};
+std::uint32_t                      g_worker_count{};     // Thread pool worker count.
+std::uint32_t                      g_perf_core_count{};  // P-cores detected (0 = homogeneous/unknown).
+std::uint32_t                      g_total_core_count{}; // Total logical CPUs on the system.
+std::unique_ptr<dp::thread_pool<>> g_thread_pool{};      // Box2D task thread pool.
+std::atomic<std::uint32_t>         g_next_worker{};      // Round-robin worker index for thread-local storage.
+std::int32_t                       g_task_count{};       // Active Box2D tasks in g_task_storage.
 
 // Physics.
 b2WorldId    g_world = b2_nullWorldId;
-float        g_physics_accumulator{};
-float        g_physics_alpha{};
-bool         g_paused{};
-bool         g_single_step{};
-std::int32_t g_step_count     = 1;
-std::int32_t g_sub_steps      = 4;
-auto         g_linear_damping = 0.1f;
+float        g_physics_accumulator{};  // Leftover time from previous frame for fixed-step integration.
+float        g_physics_alpha{};        // Interpolation factor between previous and current physics state.
+bool         g_paused{};               // Simulation paused.
+bool         g_single_step{};          // Advance one physics step then re-pause.
+std::int32_t g_step_count     = 1;     // Physics steps per frame.
+std::int32_t g_sub_steps      = 4;     // Box2D solver sub-steps per step.
+auto         g_linear_damping = 0.1f;  // Base linear drag applied to every dynamic body.
 auto         g_random_damping = 0.02f; // Max random offset added to base drag per body.
-std::size_t  g_culled_count{};
+std::size_t  g_culled_count{};         // Bodies culled from rendering this frame (outside viewport).
 
 // Camera.
-b2Vec2 g_cam_center{0.0f, 2.0f};
-auto   g_cam_zoom     = ZOOM_DEFAULT;
-auto   g_cam_zoom_min = 1.0f;
-bool   g_cam_dragging{};
+b2Vec2 g_cam_center{0.0f, 2.0f};      // Camera center in world coordinates.
+auto   g_cam_zoom     = ZOOM_DEFAULT; // Pixels per world unit.
+auto   g_cam_zoom_min = 1.0f;         // Minimum zoom level (clamped to keep viewport inside world bounds).
+bool   g_cam_dragging{};              // Middle-mouse camera pan in progress.
 
 // Graphics.
 int    g_vsync   = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
@@ -96,7 +104,7 @@ int    g_total_vtx{};                           // Last frame's total vertex cou
 int    g_total_idx{};                           // Last frame's total index count.
 
 // Bodies.
-b2BodyId g_ground_id = b2_nullBodyId;
+b2BodyId g_ground_id = b2_nullBodyId; // Static ground body (world boundary).
 
 struct BodyState
 {
@@ -114,7 +122,7 @@ struct PhysBody
     bool        selected{};
 };
 
-std::vector<PhysBody> g_bodies{};
+std::vector<PhysBody> g_bodies{}; // All spawned dynamic bodies.
 
 // Drawing.
 struct DrawnLine
@@ -123,8 +131,8 @@ struct DrawnLine
     std::vector<b2Vec2> points{};
 };
 
-std::vector<DrawnLine> g_drawn_lines{};
-std::vector<b2Vec2>    g_current_stroke{};
+std::vector<DrawnLine> g_drawn_lines{};    // Committed freehand-drawn ground segments.
+std::vector<b2Vec2>    g_current_stroke{}; // Points in the in-progress drawing stroke.
 
 // Emitters.
 struct Emitter
@@ -138,7 +146,7 @@ struct Emitter
     bool       active{};
 };
 
-std::vector<Emitter> g_emitters{};
+std::vector<Emitter> g_emitters{}; // All body emitters.
 
 // Force zones: Areas that apply forces to dynamic bodies.
 enum class FieldType : std::uint8_t
@@ -163,10 +171,10 @@ struct ForceZone
     bool         active          = true;
 };
 
-std::vector<ForceZone>     g_force_zones{};
-std::optional<std::size_t> g_dragging_zone{};
+std::vector<ForceZone>     g_force_zones{};   // All active force zone regions.
+std::optional<std::size_t> g_dragging_zone{}; // Index of force zone being dragged, if any.
 
-// Ropes: Chain of small circle bodies connected by distance joints.
+// Ropes: Chain of capsule segments connected by revolute joints.
 struct Rope
 {
     std::vector<b2BodyId>  segments{};             // Intermediate chain links.
@@ -177,9 +185,9 @@ struct Rope
     b2Vec2                 local_b{};              // Attach point in body_b's local space.
 };
 
-std::vector<Rope> g_ropes{};
-b2BodyId          g_rope_start_body = b2_nullBodyId;
-b2Vec2            g_rope_start_anchor{};
+std::vector<Rope> g_ropes{};                         // All ropes (intact and cut halves).
+b2BodyId          g_rope_start_body = b2_nullBodyId; // First body clicked when creating a rope.
+b2Vec2            g_rope_start_anchor{};             // Local-space attach point on rope start body.
 
 struct Pin
 {
@@ -187,18 +195,18 @@ struct Pin
     b2BodyId  body  = b2_nullBodyId;
 };
 
-std::vector<Pin> g_pins{};
+std::vector<Pin> g_pins{}; // All pinned bodies (revolute joint to ground).
 
 // Interaction.
-b2JointId                  g_mouse_joint = b2_nullJointId;
-b2BodyId                   g_mouse_body  = b2_nullBodyId;
-bool                       g_box_selecting{};
-ImVec2                     g_box_select_start{};
-std::optional<std::size_t> g_dragged_emitter{};
-bool                       g_erasing{};
-bool                       g_cutting{};
-bool                       g_just_pinned{};
-bool                       g_just_cut{};
+b2JointId                  g_mouse_joint = b2_nullJointId; // Joint for mouse-drag interaction.
+b2BodyId                   g_mouse_body  = b2_nullBodyId;  // Body currently being mouse-dragged.
+bool                       g_box_selecting{};              // Box-selection drag in progress.
+ImVec2                     g_box_select_start{};           // Screen-space start point of box selection.
+std::optional<std::size_t> g_dragged_emitter{};            // Index of emitter being repositioned.
+bool                       g_erasing{};                    // Ctrl+Right-drag rope eraser active.
+bool                       g_cutting{};                    // Shift+Right-drag rope cutter active.
+bool                       g_just_pinned{};                // Suppresses right-click selection after pinning.
+bool                       g_just_cut{};                   // Limits rope cutting to one cut per drag.
 
 struct TaskHandle
 {
@@ -209,9 +217,360 @@ struct TaskHandle
 
 alignas(TaskHandle) std::byte g_task_storage[MAX_TASKS][sizeof(TaskHandle)];
 
-// Silly fix for window dragging stutter.
+[[nodiscard]] std::vector<std::byte> read_binary_file(std::string_view filename, std::size_t read_size = 0) noexcept
+{
+    if (filename.empty())
+    {
+        return {};
+    }
+
+#if defined(_WIN32)
+    FILE *file;
+    if (fopen_s(&file, filename.data(), "rb") != 0)
+#else
+    auto *file = std::fopen(filename.data(), "rb");
+    if (file == nullptr)
+#endif
+    {
+        return {};
+    }
+
+    auto guard = sg::make_scope_guard([&file]() noexcept { std::fclose(file); });
+
+    // If a specific read size was requested, use it directly.
+    if (read_size > 0)
+    {
+        std::vector<std::byte> result{};
+        try
+        {
+            result.resize(read_size);
+        }
+        catch (...)
+        {
+            return {};
+        }
+
+        if (std::fread(result.data(), 1, read_size, file) != read_size)
+        {
+            return {};
+        }
+
+        return result;
+    }
+
+    // Try to get the file size via seeking.
+#if defined(_WIN32)
+    long long file_size = -1;
+    if (_fseeki64(file, 0, SEEK_END) == 0)
+    {
+        file_size = _ftelli64(file);
+        _fseeki64(file, 0, SEEK_SET);
+    }
+#else
+    off_t file_size = -1;
+    if (fseeko(file, 0, SEEK_END) == 0)
+    {
+        file_size = ftello(file);
+        fseeko(file, 0, SEEK_SET);
+    }
+#endif
+
+    // We have a valid size, read it all in one go.
+    if (file_size > 0)
+    {
+        std::vector<std::byte> result{};
+        if ((std::size_t)file_size > result.max_size())
+        {
+            return {};
+        }
+
+        try
+        {
+            result.resize((std::size_t)file_size);
+        }
+        catch (...)
+        {
+            return {};
+        }
+
+        if (std::fread(result.data(), 1, result.size(), file) != result.size())
+        {
+            return {};
+        }
+
+        return result;
+    }
+
+    // Size unknown or zero. Try to read in chunks as a last resort.
+    constexpr std::size_t CHUNK_SIZE = 4096;
+
+    std::vector<std::byte> result{};
+    try
+    {
+        result.reserve(CHUNK_SIZE);
+    }
+    catch (...)
+    {
+        return {};
+    }
+
+    for (;;)
+    {
+        std::array<std::byte, CHUNK_SIZE> chunk{};
+        auto                              read_amount = std::fread(chunk.data(), 1, CHUNK_SIZE, file);
+        if (read_amount > 0)
+        {
+            try
+            {
+                result.insert(result.end(), chunk.begin(), chunk.begin() + (std::ptrdiff_t)read_amount);
+            }
+            catch (...)
+            {
+                return {};
+            }
+        }
+
+        // Read error.
+        if (std::ferror(file) != 0)
+        {
+            return {};
+        }
+
+        // Reached end of file.
+        if (std::feof(file) != 0)
+        {
+            break;
+        }
+    }
+
+    return result;
+}
+
+// Platform: P-core detection and thread affinity.
+// Box2D performs best on performance cores sharing a single L2 cache.
+// We detect P-cores (highest `EfficiencyClass` on Windows, highest `base_frequency` on Linux) and pin thread-pool workers to them. On homogeneous
+// CPUs all cores qualify.
 #if defined(_WIN32)
 #include <dwmapi.h>
+
+struct CoreTopology
+{
+    std::vector<DWORD> perf_cpu_set_ids{}; // CPU Set IDs for `SetThreadSelectedCpuSets`.
+    std::uint32_t      total_logical{};
+};
+
+[[nodiscard]] CoreTopology detect_performance_cores()
+{
+    // First call gets required buffer size. Returns `FALSE` with `ERROR_INSUFFICIENT_BUFFER`.
+    ULONG buffer_size;
+    if (GetSystemCpuSetInformation(nullptr, 0, &buffer_size, GetCurrentProcess(), 0) != FALSE || buffer_size == 0)
+    {
+        return {};
+    }
+
+    std::vector<std::byte> buffer(buffer_size);
+    ULONG                  returned_size;
+    if (GetSystemCpuSetInformation((SYSTEM_CPU_SET_INFORMATION *)buffer.data(), buffer_size, &returned_size, GetCurrentProcess(), 0) == FALSE)
+    {
+        return {};
+    }
+
+    CoreTopology result{};
+    BYTE         max_efficiency{};
+
+    // Single pass: Count CPUs, find max `EfficiencyClass`, collect all entries.
+    struct CPUEntry
+    {
+        DWORD id{};
+        BYTE  efficiency{};
+    };
+
+    std::vector<CPUEntry> entries{};
+    auto                 *cursor = buffer.data();
+    auto                 *end    = buffer.data() + returned_size;
+    while (cursor < end)
+    {
+        auto *info = (SYSTEM_CPU_SET_INFORMATION *)cursor;
+        if (info->Type == CpuSetInformation)
+        {
+            ++result.total_logical;
+
+            max_efficiency = std::max(max_efficiency, info->CpuSet.EfficiencyClass);
+
+            entries.emplace_back(info->CpuSet.Id, info->CpuSet.EfficiencyClass);
+        }
+
+        cursor += info->Size;
+    }
+
+    // Keep only CPUs at the highest `EfficiencyClass` (= P-cores).
+    for (auto &&entry : entries)
+    {
+        if (entry.efficiency == max_efficiency)
+        {
+            result.perf_cpu_set_ids.emplace_back(entry.id);
+        }
+    }
+
+    return result;
+}
+
+void bind_thread_to_perf_cores(const std::vector<DWORD> &cpu_set_ids)
+{
+    if (cpu_set_ids.empty())
+    {
+        return;
+    }
+
+    SetThreadSelectedCpuSets(GetCurrentThread(), cpu_set_ids.data(), cpu_set_ids.size());
+}
+
+#elif defined(__linux__)
+#include <sched.h>
+
+struct CoreTopology
+{
+    std::vector<int> perf_cpu_indices{}; // Logical CPU indices for `cpu_set_t`.
+    std::uint32_t    total_logical{};
+};
+
+// Parse a small sysfs text file as a string. Returns empty on failure.
+[[nodiscard]] std::string read_sysfs_text(const std::string &path)
+{
+    auto bytes = read_binary_file(path);
+    if (bytes.empty())
+    {
+        return {};
+    }
+
+    // Trim trailing newline.
+    std::string text((const char *)bytes.data(), bytes.size());
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+    {
+        text.pop_back();
+    }
+
+    return text;
+}
+
+[[nodiscard]] CoreTopology detect_performance_cores()
+{
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count <= 0)
+    {
+        return {};
+    }
+
+    int num_cpus = (int)cpu_count; // Narrowing is safe; CPU count will never exceed INT_MAX.
+
+    CoreTopology result{};
+    result.total_logical = (std::uint32_t)num_cpus;
+
+    // Strategy 1: Try sysfs cpu_type (modern kernels).
+    // P-cores report "intel_core", E-cores report "intel_atom".
+    // Non-hybrid or non-Intel CPUs may not have this file at all.
+    std::vector<int> core_indices{};
+    for (int i{}; i < num_cpus; ++i)
+    {
+        auto type = read_sysfs_text(std::format("/sys/devices/system/cpu/cpu{}/cpu_type", i));
+        if (!type.empty() && !type.contains("atom"))
+        {
+            core_indices.emplace_back(i);
+        }
+    }
+
+    if (!core_indices.empty())
+    {
+        result.perf_cpu_indices = std::move(core_indices);
+
+        return result;
+    }
+
+    // Strategy 2: Compare base_frequency across CPUs.
+    //   P-cores have higher base frequency than E-cores.
+    std::vector<std::pair<int, long>> cpu_freqs{};
+    cpu_freqs.reserve(num_cpus);
+
+    for (int i{}; i < num_cpus; ++i)
+    {
+        auto text = read_sysfs_text(std::format("/sys/devices/system/cpu/cpu{}/cpufreq/base_frequency", i));
+        if (text.empty())
+        {
+            continue;
+        }
+
+        long freq{};
+        auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), freq);
+        if (ec == std::errc{} && freq > 0)
+        {
+            cpu_freqs.emplace_back(i, freq);
+        }
+    }
+
+    if (!cpu_freqs.empty())
+    {
+        long max_freq{};
+        for (auto &&[cpu, freq] : cpu_freqs)
+        {
+            max_freq = std::max(max_freq, freq);
+        }
+
+        // Only filter if there's a meaningful frequency gap (>10%).
+        long threshold = max_freq * 9 / 10;
+        for (auto &&[cpu, freq] : cpu_freqs)
+        {
+            if (freq >= threshold)
+            {
+                result.perf_cpu_indices.emplace_back(cpu);
+            }
+        }
+
+        if (!result.perf_cpu_indices.empty())
+        {
+            return result;
+        }
+    }
+
+    // Fallback: All CPUs are performance cores (homogeneous or unknown).
+    result.perf_cpu_indices.resize(num_cpus);
+    std::iota(result.perf_cpu_indices.begin(), result.perf_cpu_indices.end(), 0);
+
+    return result;
+}
+
+void bind_thread_to_perf_cores(const std::vector<int> &cpu_indices)
+{
+    if (cpu_indices.empty())
+    {
+        return;
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+
+    for (auto &&cpu : cpu_indices)
+    {
+        CPU_SET(cpu, &set);
+    }
+
+    sched_setaffinity(0, sizeof(cpu_set_t), &set);
+}
+
+#else // macOS / other: No affinity control on Apple Silicon.
+
+struct CoreTopology
+{
+    std::uint32_t total_logical{};
+};
+
+[[nodiscard]] CoreTopology detect_performance_cores() { return {(std::uint32_t)std::thread::hardware_concurrency()}; }
+
+void bind_thread_to_perf_cores() {}
+
+#endif
+
+// Silly fix for window dragging stutter.
+#if defined(_WIN32)
 
 WNDPROC g_original_wndproc{};
 
@@ -226,6 +585,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     return result;
 }
+
 #endif
 
 // Brighten an `ImU32` color by adding `amount` to each RGB channel, clamped to 255.
@@ -269,7 +629,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     b2BodyId result = b2_nullBodyId;
     b2World_OverlapShape(
         g_world, &proxy, b2DefaultQueryFilter(),
-        [](b2ShapeId shapeId, void *context)
+        [](b2ShapeId shapeId, void *context) noexcept
         {
             auto body = b2Shape_GetBody(shapeId);
             if (b2Body_GetType(body) != b2_dynamicBody)
@@ -533,14 +893,15 @@ void tick_force_zones()
             b2Vec2    center;
             float     strength;
             float     max_speed;
+            float     radius;
             float     radius_sq;
             float     angle;
             FieldType type;
-        } context{zone.position, zone.strength, zone.max_speed, zone.radius * zone.radius, zone.angle, zone.type};
+        } context{zone.position, zone.strength, zone.max_speed, zone.radius, zone.radius * zone.radius, zone.angle, zone.type};
 
         b2World_OverlapAABB(
             g_world, aabb, b2DefaultQueryFilter(),
-            [](b2ShapeId shape_id, void *user_data)
+            [](b2ShapeId shape_id, void *user_data) noexcept
             {
                 auto body = b2Shape_GetBody(shape_id);
                 if (b2Body_GetType(body) != b2_dynamicBody)
@@ -576,7 +937,7 @@ void tick_force_zones()
                     auto   dist       = std::sqrt(dist_sq);
                     auto   inv_dist   = 1.0f / dist;
                     auto   normalized = delta * inv_dist;
-                    auto   falloff    = 1.0f - dist / std::sqrt(ctx.radius_sq);
+                    auto   falloff    = 1.0f - dist / ctx.radius;
                     b2Vec2 tangent{-normalized.y, normalized.x};
                     force = b2RotateVector(angle_rot, tangent) * (ctx.strength * mass * falloff);
 
@@ -592,7 +953,7 @@ void tick_force_zones()
                     auto dist      = std::sqrt(dist_sq);
                     auto inv_dist  = 1.0f / dist;
                     auto direction = delta * inv_dist;
-                    auto falloff   = 1.0f - dist / std::sqrt(ctx.radius_sq);
+                    auto falloff   = 1.0f - dist / ctx.radius;
                     force          = b2RotateVector(angle_rot, direction * -1.0f) * (ctx.strength * mass * falloff);
 
                     break;
@@ -607,7 +968,7 @@ void tick_force_zones()
                     auto dist      = std::sqrt(dist_sq);
                     auto inv_dist  = 1.0f / dist;
                     auto direction = delta * inv_dist;
-                    auto falloff   = 1.0f - dist / std::sqrt(ctx.radius_sq);
+                    auto falloff   = 1.0f - dist / ctx.radius;
                     force          = b2RotateVector(angle_rot, direction) * (ctx.strength * mass * falloff);
 
                     break;
@@ -619,7 +980,7 @@ void tick_force_zones()
                 }
                 }
 
-                // Terminal velocity: scale force to zero as body approaches max_speed.
+                // Terminal velocity: Scale force to zero as body approaches max_speed.
                 if (ctx.max_speed > 0.0f)
                 {
                     auto force_len_sq = b2LengthSquared(force);
@@ -812,8 +1173,12 @@ SDL_AppResult SDL_AppInit([[maybe_unused]] void **appstate, [[maybe_unused]] std
         return SDL_APP_FAILURE;
     }
 
-    // VSync defaults to on. Non-fatal if unsupported.
-    SDL_SetRenderVSync(g_renderer, g_vsync);
+    // Adaptive vsync preferred. Falls back to regular vsync if unsupported.
+    if (!SDL_SetRenderVSync(g_renderer, g_vsync) && g_vsync == SDL_RENDERER_VSYNC_ADAPTIVE)
+    {
+        g_vsync = 1;
+        SDL_SetRenderVSync(g_renderer, g_vsync);
+    }
 
     g_renderer_name = SDL_GetRendererName(g_renderer);
     if (g_renderer_name == nullptr)
@@ -839,10 +1204,39 @@ SDL_AppResult SDL_AppInit([[maybe_unused]] void **appstate, [[maybe_unused]] std
     ImGui_ImplSDL3_InitForSDLRenderer(g_window, g_renderer);
     ImGui_ImplSDLRenderer3_Init(g_renderer);
 
-    // Create thread pool.
-    auto num_threads = std::clamp<std::uint32_t>(std::thread::hardware_concurrency(), 1, 16);
-    g_worker_count   = num_threads <= 2 ? num_threads : num_threads - 1;
-    g_thread_pool    = std::make_unique<dp::thread_pool<>>(g_worker_count);
+    // Detect performance cores and create thread pool pinned to them.
+    auto topology = detect_performance_cores();
+
+    g_total_core_count = topology.total_logical;
+
+#if defined(_WIN32)
+    g_perf_core_count = (std::uint32_t)topology.perf_cpu_set_ids.size();
+#elif defined(__linux__)
+    g_perf_core_count = (std::uint32_t)topology.perf_cpu_indices.size();
+#else
+    g_perf_core_count = topology.total_logical;
+#endif
+
+    auto num_threads = std::max(1u, g_perf_core_count > 0 ? g_perf_core_count : g_total_core_count);
+
+    g_worker_count = num_threads <= 2 ? num_threads : num_threads - 1;
+
+#if defined(_WIN32)
+    g_thread_pool =
+        std::make_unique<dp::thread_pool<>>(g_worker_count, [ids = topology.perf_cpu_set_ids](std::size_t) { bind_thread_to_perf_cores(ids); });
+#elif defined(__linux__)
+    g_thread_pool =
+        std::make_unique<dp::thread_pool<>>(g_worker_count, [idx = topology.perf_cpu_indices](std::size_t) { bind_thread_to_perf_cores(idx); });
+#else
+    g_thread_pool = std::make_unique<dp::thread_pool<>>(g_worker_count);
+#endif
+
+    // Pin the main (render) thread to P-cores as well.
+#if defined(_WIN32)
+    bind_thread_to_perf_cores(topology.perf_cpu_set_ids);
+#elif defined(__linux__)
+    bind_thread_to_perf_cores(topology.perf_cpu_indices);
+#endif
 
     // Create world.
     auto world_def            = b2DefaultWorldDef();
@@ -1193,7 +1587,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         if (ImGui::CollapsingHeader("Info", ImGuiTreeNodeFlags_DefaultOpen))
         {
             ImGui::Text("Bodies: %zu (%d awake, %zu culled)", g_bodies.size(), b2World_GetAwakeBodyCount(g_world), g_culled_count);
-            ImGui::Text("Workers: %u", g_worker_count);
+            ImGui::Text("Workers: %u (P-cores: %u / %u)", g_worker_count, g_perf_core_count, g_total_core_count);
 
             auto counters = b2World_GetCounters(g_world);
             ImGui::Text("Islands: %d", counters.islandCount);
@@ -1216,7 +1610,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             combo("VSync", vsync_index, "Off\0On\0Adaptive\0", 3);
 
             g_vsync = VSYNC_VALUES[vsync_index];
-            SDL_SetRenderVSync(g_renderer, g_vsync);
+            if (!SDL_SetRenderVSync(g_renderer, g_vsync) && g_vsync == SDL_RENDERER_VSYNC_ADAPTIVE)
+            {
+                g_vsync     = 1;
+                vsync_index = 1;
+                SDL_SetRenderVSync(g_renderer, g_vsync);
+            }
 
             slider("FPS Cap", g_fps_cap, 0, 1000, 10, g_fps_cap == 0 ? "Off" : "%d");
 
@@ -1621,7 +2020,6 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 auto ctrl1 = to_screen(curr + tangent_start);
                 auto ctrl2 = to_screen(next - tangent_end);
                 auto end   = to_screen(next);
-
                 bg->PathBezierCubicCurveTo(ctrl1, ctrl2, end);
             }
 
@@ -1785,12 +2183,16 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             // Arrow grid: Sample field vectors on a grid and draw small arrows.
             constexpr float ARROW_SCALE = 0.3f;
 
-            auto grid_cells    = zone.grid_resolution;
-            auto extent_x      = zone.type == FieldType::Uniform ? zone.half_size.x : zone.radius;
-            auto extent_y      = zone.type == FieldType::Uniform ? zone.half_size.y : zone.radius;
-            auto cell_x        = extent_x * 2.0f / (float)grid_cells;
-            auto cell_y        = extent_y * 2.0f / (float)grid_cells;
-            auto arrow_max_len = std::min(cell_x, cell_y) * ARROW_SCALE * g_cam_zoom;
+            auto grid_cells     = zone.grid_resolution;
+            auto extent_x       = zone.type == FieldType::Uniform ? zone.half_size.x : zone.radius;
+            auto extent_y       = zone.type == FieldType::Uniform ? zone.half_size.y : zone.radius;
+            auto cell_x         = extent_x * 2.0f / (float)grid_cells;
+            auto cell_y         = extent_y * 2.0f / (float)grid_cells;
+            auto arrow_max_len  = std::min(cell_x, cell_y) * ARROW_SCALE * g_cam_zoom;
+            auto arrow_world_len = std::min(cell_x, cell_y) * ARROW_SCALE;
+            auto inner_radius_sq = zone.type != FieldType::Uniform
+                                       ? (zone.radius - arrow_world_len) * (zone.radius - arrow_world_len)
+                                       : 0.0f;
             for (std::int32_t gy{}; gy < grid_cells; ++gy)
             {
                 for (std::int32_t gx{}; gx < grid_cells; ++gx)
@@ -1800,12 +2202,12 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     auto   sample_y = zone.position.y - extent_y + cell_y * ((float)gy + 0.5f);
                     b2Vec2 sample{sample_x, sample_y};
 
-                    // For circular types, skip samples outside the radius.
+                    // For circular types, skip samples whose arrow would extend past the boundary.
                     if (zone.type != FieldType::Uniform)
                     {
                         auto delta   = sample - zone.position;
                         auto dist_sq = b2LengthSquared(delta);
-                        if (dist_sq > zone.radius * zone.radius)
+                        if (dist_sq > inner_radius_sq)
                         {
                             continue;
                         }
@@ -1881,14 +2283,16 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                         continue;
                     }
 
-                    // Draw arrow: Line + triangle head.
+                    // Draw arrow centered on sample: Tail behind, tip ahead.
                     auto   screen_sample = to_screen(sample);
                     ImVec2 screen_dir{field_dir.x * arrow_max_len, -field_dir.y * arrow_max_len};
-                    auto   arrow_tip = screen_sample + screen_dir;
+                    auto   half_dir  = screen_dir * 0.5f;
+                    auto   arrow_tail = screen_sample - half_dir;
+                    auto   arrow_tip  = screen_sample + half_dir;
                     ImVec2 arrow_perp{-screen_dir.y * 0.3f, screen_dir.x * 0.3f};
-                    auto   arrow_base = screen_sample + screen_dir * 0.55f;
-                    bg->AddLine(screen_sample, arrow_base, arrow_color, thickness);
-                    bg->AddTriangleFilled(arrow_tip, arrow_base + arrow_perp, arrow_base - arrow_perp, arrow_color);
+                    auto   head_base  = screen_sample + half_dir * 0.1f;
+                    bg->AddLine(arrow_tail, head_base, arrow_color, thickness);
+                    bg->AddTriangleFilled(arrow_tip, head_base + arrow_perp, head_base - arrow_perp, arrow_color);
                 }
             }
 
@@ -2591,7 +2995,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 auto left_count  = cut_seg;
                 auto right_count = seg_count - cut_seg;
 
-                constexpr auto HALF_LEN = 0.15f * 0.5f;
+                constexpr auto HALF_LEN = 0.15f * 0.6f;
 
                 // Helper: Create a revolute joint between two bodies.
                 auto make_rev = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to)
