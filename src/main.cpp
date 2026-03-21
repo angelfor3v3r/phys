@@ -432,7 +432,7 @@ void bind_thread_to_perf_cores(const std::vector<DWORD> &cpu_set_ids)
         return;
     }
 
-    SetThreadSelectedCpuSets(GetCurrentThread(), cpu_set_ids.data(), cpu_set_ids.size());
+    SetThreadSelectedCpuSets(GetCurrentThread(), cpu_set_ids.data(), (ULONG)cpu_set_ids.size());
 }
 
 #elif defined(__linux__)
