@@ -139,8 +139,6 @@ jobs:
             cd "$name"
             if ls *.flatpak 1>/dev/null 2>&1; then
               mv *.flatpak "../${name}.flatpak"
-            elif ls *.exe 1>/dev/null 2>&1; then
-              zip "../${name}.zip" *.exe
             else
               zip "../${name}.zip" *
             fi
