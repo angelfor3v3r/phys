@@ -41,6 +41,7 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 | Box2D | 3.1.1 | Rigid body physics (v3 C API, AVX2 optional via PHYS_AVX2) |
 | FreeType | 2.14.2 | Font rasterization for ImGui |
 | dp::thread-pool | 0.7.0 | Worker threads shared with Box2D task system |
+| scope_guard | 1.1.0 | RAII scope guard for file cleanup in read_binary_file |
 
 ## Architecture
 
@@ -49,6 +50,8 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - **Box2D multithreading** wired via `box2d_enqueue_task`/`box2d_finish_task` using `std::latch` over a thread pool.
 - **Rendering** uses ImGui background/foreground draw lists exclusively (no raw SDL draw calls).
 - **Fixed timestep** with accumulator + interpolation (`g_physics_alpha`). Sleeping bodies skip interpolation.
+- **P-core detection** at init: pins thread pool workers + main thread to performance cores. Windows (`GetSystemCpuSetInformation`), Linux (sysfs `cpu_type` / `base_frequency`), macOS (no-op).
+- **Cross-platform file I/O** via `read_binary_file()`: RAII scope guard, Windows (`fopen_s`/`_fseeki64`/`_ftelli64`) and POSIX (`fopen`/`fseeko`/`ftello`) paths, chunked fallback for unseekable files.
 
 ## Code style
 
@@ -59,9 +62,15 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - `auto` used liberally for local variables.
 - `std::int32_t` / `std::uint32_t` / `std::size_t` — no bare `int` for sizes or counts.
 - Globals prefixed `g_`. Constants are `UPPER_SNAKE_CASE`.
-- Includes: third-party first, then stdlib, not sorted by clang-format (`SortIncludes: Never`).
+- Includes: third-party first, then stdlib sorted alphabetically. (`SortIncludes: Never` in clang-format — manual sort.)
 - `noexcept` on pure-computation functions/lambdas. `[[nodiscard]]` on non-void free functions.
 - `slider()` / `combo()` wrappers (with `scroll_adjust`) instead of raw ImGui widget calls.
+- **Descriptive variable names.** No abbreviations: `distance` not `dist`, `direction` not `dir`, `previous` not `prev`, `segment` not `seg`, `polygon` not `poly`, `background`/`foreground` not `bg`/`fg`, `camera` not `cam`, `frequency` not `freq`, `format` not `fmt`, `delta_time` not `dt`, `context` not `ctx`, `control` not `ctrl`, `vertices` not `verts`. Only `pos` is acceptable as abbreviation.
+- `b2Vec2` has **no `operator/`** — use `delta * (1.0f / distance)` pattern. Factor out `inverse_distance = 1.0f / distance` when used multiple times.
+- C-style casts preferred. Windows `BOOL`: check `== FALSE` or `!= FALSE`, never `!`.
+- `emplace_back` preferred over `push_back`.
+- `= {}` to clear optionals, not `.reset()`.
+- `1e-6f` for physics epsilon (division-by-zero guard), `1e-3f` for render epsilon (skip degenerate visuals).
 
 ## Key globals
 
@@ -71,12 +80,14 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 | `g_bodies` | `vector<PhysBody>` — all dynamic bodies |
 | `g_drawn_lines` | `vector<DrawnLine>` — user-drawn static line geometry |
 | `g_emitters` | `vector<Emitter>` — particle emitters |
-| `g_cam_center`, `g_cam_zoom` | Camera state |
+| `g_camera_center`, `g_camera_zoom` | Camera state |
 | `g_ropes` | `vector<Rope>` — chain links between bodies |
 | `g_pins` | `vector<Pin>` — revolute-joint pins to ground |
+| `g_force_zones` | `vector<ForceZone>` — areas applying forces to bodies |
 | `g_rope_start_body` | Pending rope endpoint (null when idle) |
 | `g_thread_pool` | Shared worker pool |
 | `g_window`, `g_renderer` | SDL window and renderer |
+| `g_perf_core_count`, `g_total_core_count` | CPU topology (P-cores vs total) |
 
 ## Platform notes
 
@@ -85,11 +96,11 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - Windows: hooks `WndProc` for `DwmFlush()` on `WM_MOVING` (drag stutter fix), links `dwmapi`.
 - Static MSVC runtime on Windows (`/MT` / `/MTd`).
 - `WIN32` subsystem on Windows (no console window).
-- Windows icon, manifest (DPI + UTF-8 + common controls v6), and RC resource in `deploy/windows/`.
+- Windows manifest: DPI awareness (PerMonitorV2 + fallback), supportedOS (Win10/11 GUID). No UTF-8 codepage (risky on oldest Win10), no Common Controls v6 (unused by SDL+ImGui).
 - Clang-on-Windows: `/MANIFEST:EMBED` stripped from link command to avoid conflict with RC-embedded manifest.
 - Renderer preference: D3D12 > D3D11 > Metal > Vulkan > OpenGL > software.
 - Camera pixel-snapped via `std::round()` to avoid subpixel blurriness.
-- Adaptive vsync by default (`SDL_RENDERER_VSYNC_ADAPTIVE`), falls back to regular vsync if unsupported.
+- Adaptive vsync by default (`SDL_RENDERER_VSYNC_ADAPTIVE`), falls back to regular vsync if unsupported. SDL does NOT auto-fallback — code explicitly retries with vsync=1.
 - FPS cap defaults to monitor refresh rate, uses `SDL_DelayPrecise` (skipped when <1ms slack remains — avoids fighting driver vsync).
 - Graphics section in UI: VSync dropdown (Off/On/Adaptive), FPS cap slider (Off or 10-1000).
 - Frame timers in Info: Physics, Render, Present, Frame (EMA-smoothed, ~100 frame window).
@@ -103,13 +114,14 @@ third_party/cmake/    -- get_cpm.cmake (CPM bootstrap)
 - Body deletion goes through `delete_selected()` — both the ImGui button and Delete key call it.
 - All coordinate transforms go through `screen_to_world()` or the `to_screen` lambda in the render block.
 - Kill bounds: `AREA_MIN/MAX ± 5m` — tied to world bounds, not viewport. Bodies destroyed just past the world edge.
-
-- Rope segments are capsules (radius 0.06, spacing 0.15) connected by revolute joints at capsule tips. Capsules extend to 60% of spacing for overlap.
+- Rope segments are capsules (`SEGMENT_RADIUS`, `SEGMENT_SPACING`, `SEGMENT_HALF_LENGTH` constants) connected by revolute joints at capsule tips. Capsules extend to 60% of spacing for overlap.
 - Rope cleanup: prune ropes with dead anchors each frame, destroy orphaned segment bodies + joints.
-- Rope cutting (Shift+Right drag): destroys all joints, splits segments into two half-ropes re-wired with revolute joints. `wire_half` guards null anchors (dangling ends get no anchor joint or filter joints).
-- Rope erasing (Ctrl+Right drag): hit-tests cursor against rope links, destroys entire rope (all joints + segment bodies).
+- Rope cutting (Shift+Right drag): destroys all joints, splits segments into two half-ropes re-wired with revolute joints. `wire_half` guards null anchors (dangling ends get no anchor joint or filter joints). Visual: red line from drag start to cursor.
+- Rope erasing (Ctrl+Right drag): inline hit-tests cursor against rope links (no allocation), destroys entire rope (all joints + segment bodies). Visual: red circle at cursor scaled to `HIT_RADIUS * g_camera_zoom`.
 - Pin cleanup: prune invalid joints each frame.
 - Pin/unpin actions set `g_just_pinned` to suppress right-click-up selection toggle.
 - All range-for loops use `auto &&`.
 - Use Box2D math builtins (`b2Dot`, `b2Lerp`, `b2NLerp`, `b2Normalize`, etc.) over custom wrappers.
-- Variable naming: `dist_def`, `rev_def`, `mouse_def`, `filter_def_a/b` for joint defs. `position`/`rotation` not `pos`/`rot`. No single-letter names except standard math (`t`).
+- Force zone overlap callback: `Context` struct passed via `void*`, precomputes `angle_rotation` (`b2Rot`) and `radius` to avoid per-body trig/sqrt. Dead fields removed — if a field isn't read in the callback, don't store it.
+- Shape queries hoisted: call `b2Shape_GetPolygon`/`b2Shape_GetCircle` once per body per frame, reuse for selection AABB + color + render.
+- Catmull-Rom rope rendering: tangents killed (zeroed) when they oppose the segment direction to prevent vertex explosion at extreme bend angles.
