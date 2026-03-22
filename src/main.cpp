@@ -236,7 +236,22 @@ void compile_formulas(ForceZone &zone)
     zone.formula_valid = ok_x && ok_y;
     if (!zone.formula_valid)
     {
-        zone.formula_error = !ok_x ? zone.parser_x.get_last_error_message() : zone.parser_y.get_last_error_message();
+        auto &failed = !ok_x ? zone.parser_x : zone.parser_y;
+        auto  msg    = failed.get_last_error_message();
+        auto  pos    = failed.get_last_error_position();
+        auto  label  = !ok_x ? "Fx" : "Fy";
+        if (!msg.empty())
+        {
+            zone.formula_error = std::format("{}: {} (col {})", label, msg, pos);
+        }
+        else if (pos >= 0)
+        {
+            zone.formula_error = std::format("{}: Error at col {}", label, pos);
+        }
+        else
+        {
+            zone.formula_error = std::format("{}: Invalid expression", label);
+        }
     }
 }
 
