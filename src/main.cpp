@@ -1,3 +1,4 @@
+#include <tinyexpr.h>
 #include <scope_guard.hpp>
 #include <thread_pool/thread_pool.h>
 #include <SDL3/SDL.h>
@@ -5,6 +6,7 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
+#include <imgui_stdlib.h>
 #include <box2d/box2d.h>
 
 #include <algorithm>
@@ -62,52 +64,61 @@ constexpr auto AREA_MIN_Y = -40.0f;
 constexpr auto AREA_MAX_Y = 120.0f;
 
 // Window / renderer.
-float         g_dpi_scaling{};   // OS display scale factor.
-int           g_window_w{};      // Window width in pixels.
-int           g_window_h{};      // Window height in pixels.
 SDL_Window   *g_window{};        // Main application window.
+float         g_dpi_scaling{};   // OS display scale factor.
 SDL_Renderer *g_renderer{};      // SDL GPU renderer.
 const char   *g_renderer_name{}; // Name of the active GPU renderer backend.
-
-// Threading.
-std::uint32_t                      g_worker_count{};     // Thread pool worker count.
-std::uint32_t                      g_perf_core_count{};  // P-cores detected (0 = homogeneous/unknown).
-std::uint32_t                      g_total_core_count{}; // Total logical CPUs on the system.
-std::unique_ptr<dp::thread_pool<>> g_thread_pool{};      // Box2D task thread pool.
-std::atomic<std::uint32_t>         g_next_worker{};      // Round-robin worker index for thread-local storage.
-std::int32_t                       g_task_count{};       // Active Box2D tasks in g_task_storage.
-
-// Physics.
-b2WorldId    g_world = b2_nullWorldId;
-float        g_physics_accumulator{};  // Leftover time from previous frame for fixed-step integration.
-float        g_physics_alpha{};        // Interpolation factor between previous and current physics state.
-bool         g_paused{};               // Simulation paused.
-bool         g_single_step{};          // Advance one physics step then re-pause.
-std::int32_t g_step_count     = 1;     // Physics steps per frame.
-std::int32_t g_sub_steps      = 4;     // Box2D solver sub-steps per step.
-auto         g_linear_damping = 0.1f;  // Base linear drag applied to every dynamic body.
-auto         g_random_damping = 0.02f; // Max random offset added to base drag per body.
-std::size_t  g_culled_count{};         // Bodies culled from rendering this frame (outside viewport).
-
-// Camera.
-b2Vec2 g_camera_center{0.0f, 10.0f};     // Camera center in world coordinates.
-auto   g_camera_zoom     = ZOOM_DEFAULT; // Pixels per world unit.
-auto   g_camera_zoom_min = 1.0f;         // Minimum zoom level (clamped to keep viewport inside world bounds).
-bool   g_camera_dragging{};              // Middle-mouse camera pan in progress.
+int           g_window_w{};      // Window width in pixels.
+int           g_window_h{};      // Window height in pixels.
 
 // Graphics.
-int    g_vsync   = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
 int    g_fps_cap = 0;                           // 0 = off, 10-1000 = target FPS. Defaults to monitor refresh rate at init.
+int    g_vsync   = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
 Uint64 g_frame_start_ns{};                      // Counter at start of frame (Nanoseconds since SDL initialization).
 float  g_physics_ms{};                          // Last frame's physics time.
 float  g_render_ms{};                           // Last frame's render time (draw list build).
 float  g_present_ms{};                          // Last frame's GPU submit + present time.
 float  g_frame_ms{};                            // Last frame's total time.
-int    g_display_fps{};                         // FPS shown on screen, updated once per second.
-int    g_frame_count{};                         // Frames counted in current second.
-Uint64 g_fps_timer_ns{};                        // Timestamp of last FPS update.
 int    g_total_vertices{};                      // Last frame's total vertex count.
 int    g_total_indices{};                       // Last frame's total index count.
+int    g_frame_count{};                         // Frames counted in current second.
+Uint64 g_fps_timer_ns{};                        // Timestamp of last FPS update.
+int    g_display_fps{};                         // FPS shown on screen, updated once per second.
+
+// Camera.
+auto   g_camera_zoom_min = 1.0f;         // Minimum zoom level (clamped to keep viewport inside world bounds).
+auto   g_camera_zoom     = ZOOM_DEFAULT; // Pixels per world unit.
+b2Vec2 g_camera_center{0.0f, 10.0f};     // Camera center in world coordinates.
+bool   g_camera_dragging{};              // Middle-mouse camera pan in progress.
+
+// Threading.
+std::uint32_t                      g_total_core_count{}; // Total logical CPUs on the system.
+std::uint32_t                      g_perf_core_count{};  // P-cores detected (0 = homogeneous/unknown).
+std::uint32_t                      g_worker_count{};     // Thread pool worker count.
+std::unique_ptr<dp::thread_pool<>> g_thread_pool{};      // Box2D task thread pool.
+std::int32_t                       g_task_count{};       // Active Box2D tasks in `g_task_storage`.
+
+struct TaskHandle
+{
+    explicit TaskHandle(std::int32_t count) noexcept : done{count} {}
+
+    std::latch done;
+};
+
+alignas(TaskHandle) std::byte g_task_storage[MAX_TASKS][sizeof(TaskHandle)]; // Placement-new storage for `TaskHandle` instances.
+std::atomic<std::uint32_t> g_next_worker{};                                  // Round-robin worker index for thread-local storage.
+
+// Physics.
+b2WorldId    g_world = b2_nullWorldId; // Box2D physics world.
+bool         g_paused{};               // Simulation paused.
+bool         g_single_step{};          // Advance one physics step then re-pause.
+std::int32_t g_step_count = 1;         // Physics steps per frame.
+std::int32_t g_sub_steps  = 4;         // Box2D solver sub-steps per step.
+float        g_physics_alpha{};        // Interpolation factor between previous and current physics state.
+float        g_physics_accumulator{};  // Leftover time from previous frame for fixed-step integration.
+auto         g_linear_damping = 0.1f;  // Base linear drag applied to every dynamic body.
+auto         g_random_damping = 0.02f; // Max random offset added to base drag per body.
+std::size_t  g_culled_count{};         // Bodies culled from rendering this frame (outside viewport).
 
 // Bodies.
 b2BodyId g_ground_id = b2_nullBodyId; // Static ground body (world boundary).
@@ -124,7 +135,7 @@ struct PhysBody
     b2ShapeId   shape      = b2_nullShapeId;
     b2ShapeType shape_type = b2_shapeTypeCount;
     BodyState   previous{};
-    float       damping_offset{}; // Random addition to g_linear_damping.
+    float       damping_offset{}; // Random addition to `g_linear_damping`.
     bool        selected{};
 };
 
@@ -154,28 +165,89 @@ struct Emitter
 
 std::vector<Emitter> g_emitters{}; // All body emitters.
 
-// Force zones: Areas that apply forces to dynamic bodies.
-enum class FieldType : std::uint8_t
+// Force zones: Areas that apply forces to dynamic bodies via user-defined formulas.
+// Formulas are evaluated per body with bound variables: x, y (relative to center), r (distance), angle (atan2).
+enum class ZoneShape : std::uint8_t
 {
-    Uniform = 0, // Constant direction (uses angle).
-    Vortex,      // Tangential swirl around center (sign of strength = CW/CCW).
-    RadialIn,    // Pull toward center (gravity well).
-    RadialOut,   // Push away from center (explosion).
+    Rectangle = 0, // Axis-aligned box boundary.
+    Circle,        // Circular boundary with radius.
     Count,
 };
+
+// Preset formula definitions for force zones.
+struct FormulaPreset
+{
+    const char *name{};
+    const char *formula_x{};
+    const char *formula_y{};
+};
+
+constexpr std::array ZONE_PRESETS = {
+    FormulaPreset{"Vortex", "-y / r", "x / r"},
+    FormulaPreset{"Radial In", "-x / r", "-y / r"},
+    FormulaPreset{"Radial Out", "x / r", "y / r"},
+    FormulaPreset{"Uniform", "1", "0"},
+    FormulaPreset{"Spiral In", "-y/r - x/r", "x/r - y/r"},
+    FormulaPreset{"Spiral Out", "-y/r + x/r", "x/r + y/r"},
+    FormulaPreset{"Turbulence", "sin(y * 3)", "cos(x * 3)"},
+    FormulaPreset{"Saddle", "x", "-y"},
+    FormulaPreset{"Dipole", "2*x*y / (r*r)", "(x*x - y*y) / (r*r)"},
+};
+
+constexpr int ZONE_PRESET_COUNT  = (int)ZONE_PRESETS.size();
+constexpr int ZONE_PRESET_CUSTOM = ZONE_PRESET_COUNT; // Index used when formula text is manually edited.
 
 struct ForceZone
 {
     b2Vec2       position{};
-    b2Vec2       half_size{2.0f, 2.0f};   // Half extents (Uniform).
-    float        angle{};                 // Radians, 0 = right. Used by Uniform only.
-    float        strength        = 20.0f; // Acceleration (m/s^2). Negative strength reverses vortex direction.
+    b2Vec2       half_size{2.0f, 2.0f};   // Half extents (Rectangle).
+    float        angle{};                 // Radians. Rotates the evaluated force vector.
+    float        strength        = 20.0f; // Acceleration (m/s^2). Scales the evaluated formula.
     float        max_speed       = 30.0f; // Terminal velocity (m/s). Force scales to zero at this speed. 0 = unlimited.
-    float        radius          = 5.0f;  // Area-of-effect for Vortex/Radial types.
+    float        radius          = 5.0f;  // Area-of-effect (Circle).
     std::int32_t grid_resolution = 5;     // Arrow grid NxN resolution.
-    FieldType    type            = FieldType::Uniform;
+    int          preset          = 0;     // Index into `ZONE_PRESETS`, or `ZONE_PRESET_CUSTOM` for user-edited.
+    ZoneShape    shape           = ZoneShape::Circle;
     bool         active          = true;
+
+    // Formula fields evaluated per body via tinyexpr++.
+    std::string formula_x = ZONE_PRESETS[0].formula_x; // X component of force direction.
+    std::string formula_y = ZONE_PRESETS[0].formula_y; // Y component of force direction.
+    te_parser   parser_x{};                            // Compiled X expression.
+    te_parser   parser_y{};                            // Compiled Y expression.
+    double      bound_x{};                             // Bound variable: Body X relative to zone center.
+    double      bound_y{};                             // Bound variable: Body Y relative to zone center.
+    double      bound_distance{};                      // Bound variable: Distance from zone center (formula name: `r`).
+    double      bound_angle{};                         // Bound variable: `atan2(y, x)` angle to zone center.
+    bool        formula_valid{};                       // True if both formulas compiled successfully.
+    std::string formula_error{};                       // Error message from last failed compile.
 };
+
+// Compile formula expressions. Call when formula text changes.
+void compile_formulas(ForceZone &zone)
+{
+    zone.parser_x.set_variables_and_functions(
+        {{"x", &zone.bound_x}, {"y", &zone.bound_y}, {"r", &zone.bound_distance}, {"angle", &zone.bound_angle}});
+    zone.parser_y.set_variables_and_functions(
+        {{"x", &zone.bound_x}, {"y", &zone.bound_y}, {"r", &zone.bound_distance}, {"angle", &zone.bound_angle}});
+
+    auto ok_x          = zone.parser_x.compile(zone.formula_x);
+    auto ok_y          = zone.parser_y.compile(zone.formula_y);
+    zone.formula_valid = ok_x && ok_y;
+    if (!zone.formula_valid)
+    {
+        zone.formula_error = !ok_x ? zone.parser_x.get_last_error_message() : zone.parser_y.get_last_error_message();
+    }
+}
+
+// Apply a preset by index. Fills formula strings and recompiles.
+void apply_zone_preset(ForceZone &zone, int index)
+{
+    zone.preset    = index;
+    zone.formula_x = ZONE_PRESETS[(std::size_t)index].formula_x;
+    zone.formula_y = ZONE_PRESETS[(std::size_t)index].formula_y;
+    compile_formulas(zone);
+}
 
 std::vector<ForceZone>     g_force_zones{};   // All active force zone regions.
 std::optional<std::size_t> g_dragging_zone{}; // Index of force zone being dragged, if any.
@@ -184,21 +256,22 @@ std::optional<std::size_t> g_dragging_zone{}; // Index of force zone being dragg
 struct Rope
 {
     std::vector<b2BodyId>  segments{};             // Intermediate chain links.
-    std::vector<b2JointId> joints{};               // All joints (distance + filter).
+    std::vector<b2JointId> joints{};               // All joints (revolute + filter).
     b2BodyId               body_a = b2_nullBodyId; // Anchor body at start (null if dangling).
     b2BodyId               body_b = b2_nullBodyId; // Anchor body at end   (null if dangling).
-    b2Vec2                 local_a{};              // Attach point in body_a's local space.
-    b2Vec2                 local_b{};              // Attach point in body_b's local space.
+    b2Vec2                 local_a{};              // Attach point in `body_a`'s local space.
+    b2Vec2                 local_b{};              // Attach point in `body_b`'s local space.
 };
 
 std::vector<Rope> g_ropes{};                         // All ropes (intact and cut halves).
 b2BodyId          g_rope_start_body = b2_nullBodyId; // First body clicked when creating a rope.
 b2Vec2            g_rope_start_anchor{};             // Local-space attach point on rope start body.
 
+// Pins: Revolute joint fixing a body to the static ground.
 struct Pin
 {
-    b2JointId joint = b2_nullJointId;
-    b2BodyId  body  = b2_nullBodyId;
+    b2JointId joint = b2_nullJointId; // Revolute joint anchoring body to ground.
+    b2BodyId  body  = b2_nullBodyId;  // The pinned dynamic body.
 };
 
 std::vector<Pin> g_pins{}; // All pinned bodies (revolute joint to ground).
@@ -208,21 +281,12 @@ b2JointId                  g_mouse_joint = b2_nullJointId; // Joint for mouse-dr
 b2BodyId                   g_mouse_body  = b2_nullBodyId;  // Body currently being mouse-dragged.
 bool                       g_box_selecting{};              // Box-selection drag in progress.
 ImVec2                     g_box_select_start{};           // Screen-space start point of box selection.
-std::optional<std::size_t> g_dragged_emitter{};            // Index of emitter being repositioned.
-bool                       g_erasing{};                    // Ctrl+Right-drag rope eraser active.
 bool                       g_cutting{};                    // Shift+Right-drag rope cutter active.
-ImVec2                     g_cut_start{};                  // Screen-space start point of rope cut drag.
-bool                       g_just_pinned{};                // Suppresses right-click selection after pinning.
 bool                       g_just_cut{};                   // Limits rope cutting to one cut per drag.
-
-struct TaskHandle
-{
-    explicit TaskHandle(std::int32_t count) noexcept : done{count} {}
-
-    std::latch done;
-};
-
-alignas(TaskHandle) std::byte g_task_storage[MAX_TASKS][sizeof(TaskHandle)];
+ImVec2                     g_cut_start{};                  // Screen-space start point of rope cut drag.
+bool                       g_erasing{};                    // Ctrl+Right-drag rope eraser active.
+std::optional<std::size_t> g_dragged_emitter{};            // Index of emitter being repositioned.
+bool                       g_just_pinned{};                // Suppresses right-click selection after pinning.
 
 [[nodiscard]] std::vector<std::byte> read_binary_file(std::string_view filename, std::size_t read_size = 0) noexcept
 {
@@ -358,8 +422,8 @@ alignas(TaskHandle) std::byte g_task_storage[MAX_TASKS][sizeof(TaskHandle)];
 // We detect P-cores (highest `EfficiencyClass` on Windows, highest `base_frequency` on Linux) and pin thread-pool workers to them. On homogeneous
 // CPUs all cores qualify.
 // TODO: On multi-CCD AMD chips (7950X3D, 9950X, Threadripper), further filter P-cores to the largest subset sharing an L3 cache.
-//       Linux: /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list
-//       Windows: GetLogicalProcessorInformationEx(RelationCache) with CacheLevel == 3
+//       Linux: `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`
+//       Windows: `GetLogicalProcessorInformationEx(RelationCache)` with `CacheLevel` == 3
 #if defined(_WIN32)
 #include <dwmapi.h>
 
@@ -434,7 +498,6 @@ void bind_thread_to_perf_cores(const std::vector<DWORD> &cpu_set_ids)
 
     SetThreadSelectedCpuSets(GetCurrentThread(), cpu_set_ids.data(), (ULONG)cpu_set_ids.size());
 }
-
 #elif defined(__linux__)
 #include <sched.h>
 
@@ -565,9 +628,10 @@ void bind_thread_to_perf_cores(const std::vector<int> &cpu_indices)
 
     sched_setaffinity(0, sizeof(cpu_set_t), &set);
 }
-
-#else // macOS / Other: No affinity control.
-
+#else
+// macOS / Other: No affinity control.
+// Apple Silicon hardcodes `ml_get_max_affinity_sets` to 0 (XNU arm64) - the Intel-era THREAD_AFFINITY_POLICY API` is non-functional.
+// QoS classes handle P/E core placement instead; default-QoS threads already land on P-cores under normal load.
 struct CoreTopology
 {
     std::uint32_t total_logical{};
@@ -576,12 +640,10 @@ struct CoreTopology
 [[nodiscard]] CoreTopology detect_performance_cores() { return {(std::uint32_t)std::thread::hardware_concurrency()}; }
 
 void bind_thread_to_perf_cores() {}
-
 #endif
 
 // Silly fix for window dragging stutter.
 #if defined(_WIN32)
-
 WNDPROC g_original_wndproc{};
 
 LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -595,7 +657,6 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     return result;
 }
-
 #endif
 
 // Brighten an `ImU32` color by adding `amount` to each RGB channel, clamped to 255.
@@ -657,7 +718,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 void add_box(b2Vec2 position, float half_width, float half_height)
 {
-    auto random_offset     = SDL_randf() * g_random_damping;
+    auto random_offset     = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
     auto body_def          = b2DefaultBodyDef();
     body_def.type          = b2_dynamicBody;
     body_def.position      = position;
@@ -677,7 +738,7 @@ void add_box(b2Vec2 position, float half_width, float half_height)
 
 void add_circle(b2Vec2 position, float radius)
 {
-    auto random_offset     = SDL_randf() * g_random_damping;
+    auto random_offset     = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
     auto body_def          = b2DefaultBodyDef();
     body_def.type          = b2_dynamicBody;
     body_def.position      = position;
@@ -697,7 +758,7 @@ void add_circle(b2Vec2 position, float radius)
 
 void add_triangle(b2Vec2 position, float height)
 {
-    auto random_offset     = SDL_randf() * g_random_damping;
+    auto random_offset     = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
     auto body_def          = b2DefaultBodyDef();
     body_def.type          = b2_dynamicBody;
     body_def.position      = position;
@@ -878,14 +939,14 @@ void tick_force_zones()
 {
     for (auto &&zone : g_force_zones)
     {
-        if (!zone.active)
+        if (!zone.active || !zone.formula_valid)
         {
             continue;
         }
 
         // Build AABB for the overlap query.
         b2AABB aabb;
-        if (zone.type == FieldType::Uniform)
+        if (zone.shape == ZoneShape::Rectangle)
         {
             auto lower = zone.position - zone.half_size;
             auto upper = zone.position + zone.half_size;
@@ -893,7 +954,6 @@ void tick_force_zones()
         }
         else
         {
-            // Radial/vortex: Circular area, use radius for AABB.
             b2Vec2 extent{zone.radius, zone.radius};
             aabb = {zone.position - extent, zone.position + extent};
         }
@@ -901,14 +961,18 @@ void tick_force_zones()
         // Context passed to the overlap callback via `void*`.
         struct Context
         {
-            b2Vec2    center{};
-            b2Rot     angle_rotation{}; // Precomputed cos/sin of the zone angle.
-            float     strength{};
-            float     max_speed{};
-            float     radius{};
-            float     radius_squared{};
-            FieldType type{};
-        } context{zone.position, b2MakeRot(zone.angle), zone.strength, zone.max_speed, zone.radius, zone.radius * zone.radius, zone.type};
+            b2Vec2     center{};
+            b2Rot      angle_rotation{}; // Precomputed cos/sin of the zone angle.
+            float      strength{};
+            float      max_speed{};
+            float      radius{}; // For edge fade (Circle shape).
+            float      radius_squared{};
+            ZoneShape  shape{};
+            ForceZone *zone{}; // Pointer to zone for formula evaluation.
+        };
+
+        Context context{zone.position, b2MakeRot(zone.angle),     zone.strength, zone.max_speed,
+                        zone.radius,   zone.radius * zone.radius, zone.shape,    &zone};
 
         b2World_OverlapAABB(
             g_world, aabb, b2DefaultQueryFilter(),
@@ -920,80 +984,46 @@ void tick_force_zones()
                     return true;
                 }
 
-                constexpr auto MIN_DIST_SQUARED = 1e-6f; // Avoid division by zero at center.
+                auto &context  = *(Context *)user_data;
+                auto &zone_ref = *context.zone;
+                auto  body_pos = b2Body_GetPosition(body);
+                auto  delta    = body_pos - context.center;
 
-                auto  &context          = *(Context *)user_data;
-                auto   mass             = b2Body_GetMass(body);
-                auto   body_pos         = b2Body_GetPosition(body);
-                auto   delta            = body_pos - context.center;
-                auto   distance_squared = b2LengthSquared(delta);
-                b2Vec2 force{};
-                switch (context.type)
+                // For circular zones, skip bodies outside the radius.
+                if (context.shape == ZoneShape::Circle)
                 {
-                case FieldType::Uniform:
-                {
-                    b2Vec2 direction{context.angle_rotation.c, context.angle_rotation.s};
-                    force = direction * (context.strength * mass);
-
-                    break;
-                }
-
-                case FieldType::Vortex:
-                {
-                    if (distance_squared < MIN_DIST_SQUARED || distance_squared > context.radius_squared)
+                    if (b2LengthSquared(delta) > context.radius_squared)
                     {
                         return true;
                     }
-
-                    auto   distance         = std::sqrt(distance_squared);
-                    auto   inverse_distance = 1.0f / distance;
-                    auto   normalized       = delta * inverse_distance;
-                    auto   falloff          = 1.0f - distance / context.radius;
-                    b2Vec2 tangent{-normalized.y, normalized.x};
-                    force = b2RotateVector(context.angle_rotation, tangent) * (context.strength * mass * falloff);
-
-                    break;
                 }
 
-                case FieldType::RadialIn:
-                {
-                    if (distance_squared < MIN_DIST_SQUARED || distance_squared > context.radius_squared)
-                    {
-                        return true;
-                    }
-
-                    auto distance         = std::sqrt(distance_squared);
-                    auto inverse_distance = 1.0f / distance;
-                    auto direction        = delta * inverse_distance;
-                    auto falloff          = 1.0f - distance / context.radius;
-                    force                 = b2RotateVector(context.angle_rotation, direction * -1.0f) * (context.strength * mass * falloff);
-
-                    break;
-                }
-
-                case FieldType::RadialOut:
-                {
-                    if (distance_squared < MIN_DIST_SQUARED || distance_squared > context.radius_squared)
-                    {
-                        return true;
-                    }
-
-                    auto distance         = std::sqrt(distance_squared);
-                    auto inverse_distance = 1.0f / distance;
-                    auto direction        = delta * inverse_distance;
-                    auto falloff          = 1.0f - distance / context.radius;
-                    force                 = b2RotateVector(context.angle_rotation, direction) * (context.strength * mass * falloff);
-
-                    break;
-                }
-
-                default:
+                // Skip bodies at zone center where r-dependent formulas are singular.
+                auto distance = b2Length(delta);
+                if (distance < 1e-3f)
                 {
                     return true;
                 }
+
+                // Bind variables for tinyexpr++ evaluation.
+                zone_ref.bound_x        = (double)delta.x;
+                zone_ref.bound_y        = (double)delta.y;
+                zone_ref.bound_distance = (double)distance;
+                zone_ref.bound_angle    = std::atan2(zone_ref.bound_y, zone_ref.bound_x);
+
+                auto fx    = (float)zone_ref.parser_x.evaluate();
+                auto fy    = (float)zone_ref.parser_y.evaluate();
+                auto mass  = b2Body_GetMass(body);
+                auto force = b2RotateVector(context.angle_rotation, {fx, fy}) * (context.strength * mass);
+
+                // Edge fade for circular boundary.
+                if (context.shape == ZoneShape::Circle && context.radius > 0.0f)
+                {
+                    auto edge_fade = std::max(0.0f, 1.0f - distance / context.radius);
+                    force          = force * edge_fade;
                 }
 
-                // Terminal velocity: Scale force to zero as body approaches max_speed.
+                // Terminal velocity: Scale force to zero as body approaches `max_speed`.
                 if (context.max_speed > 0.0f)
                 {
                     auto force_len_squared = b2LengthSquared(force);
@@ -1046,7 +1076,7 @@ void *box2d_enqueue_task(b2TaskCallback *task, std::int32_t itemCount, std::int3
     {
         auto end = std::min(i + chunk_size, itemCount);
         pool.enqueue_detach(
-            [=]
+            [task, i, end, taskContext, handle]
             {
                 thread_local std::uint32_t worker = g_next_worker++;
                 task(i, end, worker, taskContext);
@@ -1398,7 +1428,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         {
             auto type = SpawnShape::Box;
             ImGui::SetDragDropPayload("SPAWN", &type, sizeof(type));
-            ImGui::Text("Box");
+            ImGui::TextUnformatted("Box");
             ImGui::EndDragDropSource();
         }
 
@@ -1411,7 +1441,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         {
             auto type = SpawnShape::Circle;
             ImGui::SetDragDropPayload("SPAWN", &type, sizeof(type));
-            ImGui::Text("Circle");
+            ImGui::TextUnformatted("Circle");
             ImGui::EndDragDropSource();
         }
 
@@ -1424,7 +1454,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         {
             auto type = SpawnShape::Triangle;
             ImGui::SetDragDropPayload("SPAWN", &type, sizeof(type));
-            ImGui::Text("Triangle");
+            ImGui::TextUnformatted("Triangle");
             ImGui::EndDragDropSource();
         }
 
@@ -1500,8 +1530,25 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         {
             if (ImGui::Button("Add Zone"))
             {
-                g_force_zones.emplace_back(g_camera_center);
+                auto &zone = g_force_zones.emplace_back(g_camera_center);
+                apply_zone_preset(zone, 0); // Default preset (Vortex).
             }
+
+            // Build null-separated preset combo string once.
+            static std::string preset_combo_items = []
+            {
+                std::string items{};
+                for (std::size_t j{}; j < ZONE_PRESETS.size(); ++j)
+                {
+                    items += ZONE_PRESETS[j].name;
+                    items += '\0';
+                }
+
+                items += "Custom";
+                items += '\0';
+
+                return items;
+            }();
 
             for (std::size_t i{}; i < g_force_zones.size(); ++i)
             {
@@ -1513,17 +1560,53 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 ImGui::SameLine();
                 ImGui::Text("Zone (z%zu)", i);
 
-                int type_idx = (int)zone.type;
-                combo("Type", type_idx, "Uniform\0Vortex\0Radial In\0Radial Out\0", (int)FieldType::Count);
+                int shape_idx = (int)zone.shape;
+                combo("Shape", shape_idx, "Rectangle\0Circle\0", (int)ZoneShape::Count);
 
-                zone.type = (FieldType)type_idx;
+                zone.shape = (ZoneShape)shape_idx;
+
+                // Preset dropdown: selecting a preset fills formula fields.
+                int previous_preset = zone.preset;
+                combo("Preset", zone.preset, preset_combo_items.c_str(), ZONE_PRESET_COUNT + 1);
+
+                if (zone.preset != previous_preset && zone.preset < ZONE_PRESET_COUNT)
+                {
+                    apply_zone_preset(zone, zone.preset);
+                }
+
+                // Formula text inputs - editing switches preset to Custom.
+                auto fx_changed = ImGui::InputText("Fx", &zone.formula_x, ImGuiInputTextFlags_EnterReturnsTrue);
+                auto fy_changed = ImGui::InputText("Fy", &zone.formula_y, ImGuiInputTextFlags_EnterReturnsTrue);
+
+                ImGui::TextDisabled("Variables: x, y, r, angle");
+
+                if (fx_changed || fy_changed)
+                {
+                    compile_formulas(zone);
+
+                    // Match against known presets; Fall back to Custom.
+                    zone.preset = ZONE_PRESET_CUSTOM;
+                    for (std::size_t j{}; j < ZONE_PRESETS.size(); ++j)
+                    {
+                        if (zone.formula_x == ZONE_PRESETS[j].formula_x && zone.formula_y == ZONE_PRESETS[j].formula_y)
+                        {
+                            zone.preset = (int)j;
+
+                            break;
+                        }
+                    }
+                }
+                if (!zone.formula_valid)
+                {
+                    ImGui::TextColored({1.0f, 0.3f, 0.3f, 1.0f}, "%s", zone.formula_error.c_str());
+                }
 
                 auto angle_deg = zone.angle * RAD_TO_DEG;
                 slider("Angle", angle_deg, -180.0f, 180.0f, 5.0f, "%.0f deg");
 
                 zone.angle = angle_deg * DEG_TO_RAD;
 
-                if (zone.type == FieldType::Uniform)
+                if (zone.shape == ZoneShape::Rectangle)
                 {
                     slider("Width", zone.half_size.x, 0.5f, 20.0f, 0.5f, "%.1f m");
                     slider("Height", zone.half_size.y, 0.5f, 20.0f, 0.5f, "%.1f m");
@@ -1583,13 +1666,10 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             slider("Sub-steps", g_sub_steps, 1, 8, 1);
 
-            auto previous_damping = g_linear_damping;
-            auto previous_random  = g_random_damping;
-            slider("Drag", g_linear_damping, 0.0f, 5.0f, 0.1f, "%.2f");
-            slider("Drag Spread", g_random_damping, 0.0f, 0.5f, 0.01f, "%.2f");
-
             // Update all existing dynamic bodies when drag settings change.
-            if (g_linear_damping != previous_damping || g_random_damping != previous_random)
+            auto drag_changed   = slider("Drag", g_linear_damping, 0.0f, 5.0f, 0.1f, "%.2f");
+            auto spread_changed = slider("Drag Spread", g_random_damping, 0.0f, 0.5f, 0.01f, "%.2f");
+            if (drag_changed || spread_changed)
             {
                 for (auto &&body : g_bodies)
                 {
@@ -1603,18 +1683,21 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
         if (ImGui::CollapsingHeader("Info", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::Text("Bodies: %zu (%d awake, %zu culled)", g_bodies.size(), b2World_GetAwakeBodyCount(g_world), g_culled_count);
-            ImGui::Text("Workers: %u (P-cores: %u / %u)", g_worker_count, g_perf_core_count, g_total_core_count);
+            // `+ 0.0f` canonicalizes IEEE 754 negative zero to positive zero (`-0.0 + 0.0 = +0.0`, §6.3).
+            ImGui::Text("Camera: (%.1f, %.1f) zoom %.1f", g_camera_center.x + 0.0f, g_camera_center.y + 0.0f, g_camera_zoom);
 
             auto counters = b2World_GetCounters(g_world);
+            ImGui::Text("Bodies: %zu (%d awake, %zu culled)", g_bodies.size(), b2World_GetAwakeBodyCount(g_world), g_culled_count);
+            ImGui::Text("Workers: %u (P-cores: %u / %u)", g_worker_count, g_perf_core_count, g_total_core_count);
             ImGui::Text("Islands: %d", counters.islandCount);
             ImGui::Text("Contacts: %d", counters.contactCount);
-            ImGui::Text("Camera: (%.1f, %.1f) zoom %.1f", g_camera_center.x + 0.0f, g_camera_center.y + 0.0f, g_camera_zoom);
             ImGui::Text("Ropes: %zu", g_ropes.size());
+
             ImGui::Text("Physics: %.2f ms", g_physics_ms);
             ImGui::Text("Render:  %.2f ms", g_render_ms);
             ImGui::Text("Present: %.2f ms", g_present_ms);
             ImGui::Text("Frame:   %.2f ms", g_frame_ms);
+
             ImGui::Text("Vertices: %d | Indices: %d", g_total_vertices, g_total_indices);
         }
 
@@ -1648,7 +1731,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             {
                 ImGui::TextColored({0.6f, 0.6f, 0.6f, 1.0f}, "%s", key);
                 ImGui::SameLine();
-                ImGui::Text("%s", action);
+                ImGui::TextUnformatted(action);
             };
 
             hint("Left-click drag", "Move body");
@@ -1726,12 +1809,14 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
                 break;
             }
+
             case SpawnShape::Circle:
             {
                 add_circle(world_point, 0.5f);
 
                 break;
             }
+
             case SpawnShape::Triangle:
             {
                 add_triangle(world_point, 1.0f);
@@ -1865,8 +1950,6 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             }
         };
 
-        auto outline_enabled = g_camera_zoom >= 15.0f;
-
         // Helper: Get the single polygon shape from a body.
         auto get_polygon = [](b2BodyId body) noexcept
         {
@@ -1903,6 +1986,8 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
         auto alpha = g_physics_alpha;
 
         g_culled_count = 0;
+
+        auto outline_enabled = g_camera_zoom >= 15.0f;
 
         for (auto &&body : g_bodies)
         {
@@ -2135,8 +2220,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             {
                 // Build point list: Anchor/tip A, segment centers, anchor/tip B.
                 // At dangling ends (cut rope), use the capsule tip instead of an anchor so the visual rope covers the full collision extent.
-                // SEGMENT_HALF_LENGTH (0.09) + SEGMENT_RADIUS (0.06) = SEGMENT_TIP_OFFSET (0.15).
-
+                // `SEGMENT_HALF_LENGTH` (0.09) + `SEGMENT_RADIUS` (0.06) = `SEGMENT_TIP_OFFSET` (0.15).
                 std::vector<b2Vec2> points{};
                 points.reserve(rope.segments.size() + 2);
 
@@ -2223,7 +2307,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             auto  thickness     = std::max(1.0f, 1.5f * g_camera_zoom / ZOOM_DEFAULT);
 
             // Draw boundary.
-            if (zone.type == FieldType::Uniform)
+            if (zone.shape == ZoneShape::Rectangle)
             {
                 auto screen_min = to_screen(zone.position - zone.half_size);
                 auto screen_max = to_screen(zone.position + zone.half_size);
@@ -2242,14 +2326,13 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             // Arrow grid: Sample field vectors on a grid and draw small arrows.
             constexpr float ARROW_SCALE = 0.3f;
 
-            auto grid_cells           = zone.grid_resolution;
-            auto extent_x             = zone.type == FieldType::Uniform ? zone.half_size.x : zone.radius;
-            auto extent_y             = zone.type == FieldType::Uniform ? zone.half_size.y : zone.radius;
-            auto cell_x               = extent_x * 2.0f / (float)grid_cells;
-            auto cell_y               = extent_y * 2.0f / (float)grid_cells;
-            auto arrow_max_len        = std::min(cell_x, cell_y) * ARROW_SCALE * g_camera_zoom;
-            auto arrow_world_len      = std::min(cell_x, cell_y) * ARROW_SCALE;
-            auto inner_radius_squared = zone.type != FieldType::Uniform ? (zone.radius - arrow_world_len) * (zone.radius - arrow_world_len) : 0.0f;
+            auto grid_cells     = zone.grid_resolution;
+            auto extent_x       = zone.shape == ZoneShape::Rectangle ? zone.half_size.x : zone.radius;
+            auto extent_y       = zone.shape == ZoneShape::Rectangle ? zone.half_size.y : zone.radius;
+            auto cell_x         = extent_x * 2.0f / (float)grid_cells;
+            auto cell_y         = extent_y * 2.0f / (float)grid_cells;
+            auto arrow_max_len  = std::min(cell_x, cell_y) * ARROW_SCALE * g_camera_zoom;
+            auto radius_squared = zone.radius * zone.radius;
             for (std::int32_t grid_y{}; grid_y < grid_cells; ++grid_y)
             {
                 for (std::int32_t grid_x{}; grid_x < grid_cells; ++grid_x)
@@ -2259,87 +2342,60 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     auto   sample_y = zone.position.y - extent_y + cell_y * ((float)grid_y + 0.5f);
                     b2Vec2 sample{sample_x, sample_y};
 
-                    // For circular types, skip samples whose arrow would extend past the boundary.
-                    if (zone.type != FieldType::Uniform)
+                    // For circular zones, skip samples whose arrow would extend past the boundary.
+                    if (zone.shape == ZoneShape::Circle)
                     {
-                        auto delta            = sample - zone.position;
-                        auto distance_squared = b2LengthSquared(delta);
-                        if (distance_squared > inner_radius_squared)
+                        auto delta_cull       = sample - zone.position;
+                        auto distance_squared = b2LengthSquared(delta_cull);
+                        if (distance_squared > radius_squared)
                         {
                             continue;
                         }
                     }
 
-                    // Compute field direction at this point.
+                    // Evaluate formula to get field direction.
                     b2Vec2 field_direction{};
-                    switch (zone.type)
+                    if (zone.formula_valid)
                     {
-                    case FieldType::Uniform:
-                    {
-                        field_direction = {std::cos(zone.angle), std::sin(zone.angle)};
-
-                        break;
-                    }
-
-                    case FieldType::Vortex:
-                    {
+                        // Skip arrows near center where formulas using r are singular.
                         auto delta    = sample - zone.position;
                         auto distance = b2Length(delta);
-                        if (distance > 1e-3f)
+                        if (distance < 1e-3f)
                         {
-                            auto inverse_distance = 1.0f / distance;
-                            auto normalized       = delta * inverse_distance;
-                            field_direction       = {-normalized.y, normalized.x};
-                            if (zone.strength < 0.0f)
-                            {
-                                field_direction = {normalized.y, -normalized.x};
-                            }
+                            continue;
                         }
 
-                        break;
-                    }
+                        zone.bound_x        = (double)delta.x;
+                        zone.bound_y        = (double)delta.y;
+                        zone.bound_distance = (double)distance;
+                        zone.bound_angle    = std::atan2(zone.bound_y, zone.bound_x);
 
-                    case FieldType::RadialIn:
-                    {
-                        auto delta    = sample - zone.position;
-                        auto distance = b2Length(delta);
-                        if (distance > 1e-3f)
+                        auto fx         = (float)zone.parser_x.evaluate();
+                        auto fy         = (float)zone.parser_y.evaluate();
+                        field_direction = {fx, fy};
+
+                        // Normalize for arrow direction.
+                        auto length = b2Length(field_direction);
+                        if (length > 1e-3f)
                         {
-                            field_direction = delta * (-1.0f / distance);
+                            field_direction = field_direction * (1.0f / length);
                         }
 
-                        break;
-                    }
-
-                    case FieldType::RadialOut:
-                    {
-                        auto delta    = sample - zone.position;
-                        auto distance = b2Length(delta);
-                        if (distance > 1e-3f)
-                        {
-                            field_direction = delta * (1.0f / distance);
-                        }
-
-                        break;
-                    }
-
-                    default:
-                    {
-                        break;
-                    }
-                    }
-
-                    // Rotate non-uniform field vectors by the zone angle.
-                    if (zone.type != FieldType::Uniform)
-                    {
+                        // Rotate by zone angle.
                         field_direction = b2RotateVector(b2MakeRot(zone.angle), field_direction);
+
+                        // Flip arrow if strength is negative.
+                        if (zone.strength < 0.0f)
+                        {
+                            field_direction = field_direction * -1.0f;
+                        }
                     }
 
-                    if (b2LengthSquared(field_direction) < 0.001f)
+                    // Skip near-zero arrows.
+                    if (b2LengthSquared(field_direction) < 1e-3f)
                     {
                         continue;
                     }
-
                     // Draw arrow centered on sample: Tail behind, tip ahead.
                     auto   screen_sample = to_screen(sample);
                     ImVec2 screen_direction{field_direction.x * arrow_max_len, -field_direction.y * arrow_max_len};
@@ -2443,9 +2499,9 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
         ImGui::StyleColorsDark();
 
-        // Apply new style stuff.
-        style.FontSizeBase = old_style.FontSizeBase;
+        // Apply new scaling.
         style.ScaleAllSizes(g_dpi_scaling);
+        style.FontSizeBase = old_style.FontSizeBase;
         style.FontScaleDpi = g_dpi_scaling;
 
         break;
@@ -2496,7 +2552,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                             shape_def.density           = 0.5f;
                             shape_def.material.friction = 0.6f;
 
-                            // Capsule: Pill shape aligned vertically, tips at +/- SEGMENT_HALF_LENGTH.
+                            // Capsule: Pill shape aligned vertically, tips at +/- `SEGMENT_HALF_LENGTH`.
                             b2Capsule capsule{{0.0f, -SEGMENT_HALF_LENGTH}, {0.0f, SEGMENT_HALF_LENGTH}, SEGMENT_RADIUS};
 
                             // Orient all capsules along the rope direction.
@@ -2612,7 +2668,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     {
                         auto &zone             = g_force_zones[i];
                         auto  distance_squared = b2LengthSquared(world_point - zone.position);
-                        auto  grab_radius      = zone.type == FieldType::Uniform ? std::max(zone.half_size.x, zone.half_size.y) : zone.radius;
+                        auto  grab_radius      = zone.shape == ZoneShape::Rectangle ? std::max(zone.half_size.x, zone.half_size.y) : zone.radius;
                         if (distance_squared <= grab_radius * grab_radius)
                         {
                             g_dragging_zone = i;
@@ -3061,7 +3117,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     return b2CreateRevoluteJoint(g_world, &revolute_def);
                 };
 
-                // Wire a sub-rope from existing segment bodies and push to g_ropes.
+                // Wire a sub-rope from existing segment bodies and push to `g_ropes`.
                 // `anchor_first`: true = `anchor` is `body_a` (left half), false = `body_b` (right half).
                 auto wire_half = [&make_rev](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segment_data, std::int32_t count, bool anchor_first)
                 {
@@ -3116,7 +3172,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     g_ropes.emplace_back(std::move(half));
                 };
 
-                // Move segments out - wire_half pushes to g_ropes which may invalidate `rope`.
+                // Move segments out - `wire_half` pushes to `g_ropes` which may invalidate `rope`.
                 auto all_segments = std::move(rope.segments);
 
                 if (left_count > 0)

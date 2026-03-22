@@ -28,6 +28,7 @@ cmake --build build
 | [FreeType](https://freetype.org/) | [FTL](https://freetype.org/license.html) |
 | [dp::thread-pool](https://github.com/DeveloperPaul123/thread-pool) | [MIT](https://github.com/DeveloperPaul123/thread-pool/blob/master/LICENSE) |
 | [scope_guard](https://github.com/ricab/scope_guard) | [Unlicense](https://github.com/ricab/scope_guard/blob/main/LICENSE) |
+| [TinyExpr++](https://github.com/Blake-Madden/tinyexpr-plusplus) | [Zlib](https://github.com/Blake-Madden/tinyexpr-plusplus/blob/tinyexpr%2B%2B/LICENSE) |
 
 ## License
 

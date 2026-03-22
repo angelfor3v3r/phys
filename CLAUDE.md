@@ -1,7 +1,7 @@
 # phys
 
-2D physics sandbox. Single-file C++23 application (`src/main.cpp`, ~3200 lines).
-Spawn rigid bodies, draw collision geometry, link bodies with ropes, cut/erase ropes, pin bodies in place, and apply force zones.
+2D physics sandbox. Single-file C++23 application (`src/main.cpp`, ~3300 lines).
+Spawn rigid bodies, draw collision geometry, link bodies with ropes, cut/erase ropes, pin bodies in place, and apply formula-driven force zones.
 
 ## Project layout
 
@@ -52,6 +52,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | FreeType | 2.14.2 | Font rasterization (all optional deps disabled) |
 | dp::thread-pool | 0.7.0 | Worker threads shared with Box2D task system |
 | scope_guard | 1.1.0 | RAII scope guard (`read_binary_file` cleanup) |
+| TinyExpr++ | 1.1.0 | Runtime math expression parser for custom force zone formulas |
 
 ## Architecture
 
@@ -108,7 +109,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 ### Enums
 
 - `SpawnShape` — Box, Circle, Triangle, Count
-- `FieldType` — Uniform, Vortex, RadialIn, RadialOut, Count
+- `ZoneShape` — Rectangle, Circle, Count
 
 ### Structs
 
@@ -118,12 +119,13 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `PhysBody` | `b2BodyId` + `b2ShapeId` + `b2ShapeType` + `BodyState previous` + `damping_offset` + `selected` |
 | `DrawnLine` | Static body + polyline points for freehand collision geometry |
 | `Emitter` | Position, angle, speed, rate, timer, shape type, active flag |
-| `ForceZone` | Position, half_size/radius, angle, strength, max_speed, grid_resolution, type, active |
+| `ForceZone` | Position, shape, radius/half_size, angle, strength, max_speed, formula strings, tinyexpr++ parsers, bound variables, preset index |
 | `Rope` | Capsule segment bodies + revolute joints + anchor body/local references |
 | `Pin` | `b2JointId` + `b2BodyId` — revolute joint pinning body to ground |
 | `TaskHandle` | `std::latch` wrapper for Box2D parallel task completion |
 | `CoreTopology` | Platform-conditional: P-core IDs + total logical CPUs |
-| `Context` | Nested in force zone callback: precomputed zone params for overlap query |
+| `Context` | Nested in `tick_force_zones`: center, angle rotation, strength, max_speed, radius, shape, zone pointer |
+| `FormulaPreset` | `name` + `formula_x` + `formula_y` — entry in `ZONE_PRESETS` array |
 
 ## Globals
 
@@ -266,7 +268,8 @@ Run `clang-format` (v20, config in `.clang-format`) before committing.
 - **Rope pruning**: checks anchor body validity each frame. Dead anchors → destroy orphan segments + joints.
 - **Rope cutting** (`wire_half` lambda): splits segments into two half-ropes, rewires revolute joints. Guards null anchors. One cut per drag (`g_just_cut`).
 - **Rope erasing**: inline hit-test with `previous_point` tracking (zero allocation). Destroys entire rope.
-- **Force zone callback**: `Context` struct precomputes `angle_rotation` (`b2Rot`) and `radius`. No per-body trig.
+- **Force zones are formula-driven**: All zone types (Vortex, Radial, Uniform, Turbulence, etc.) are presets that fill `formula_x`/`formula_y` strings. Evaluated per body via TinyExpr++ with bound variables `x`, `y` (relative to center), `r` (distance), `angle` (atan2). Preset dropdown auto-matches when user edits formula text to a known preset. `Context` struct passes zone pointer for formula evaluation in overlap callback.
+- **Force zone arrow rendering**: Grid-sampled formula evaluation, normalized for direction. Arrows flip for negative strength. Bodies/arrows within `1e-3f` of center skipped (singularity). `#if PHYS_DEBUG` shows grid lines and evaluated values at each sample point.
 - **Shape queries hoisted**: `b2Shape_GetPolygon` / `b2Shape_GetCircle` called once per body per frame, reused for selection AABB + color + render.
 - **Single-step transform bug**: previous transforms saved inside the accumulator loop, not before.
 - **Catmull-Rom tangent kill**: when `b2Dot(tangent, segment_direction) < 0`, tangent zeroed to prevent vertex explosion.

@@ -50,6 +50,7 @@ include(get_cpm)
 find_package(Threads REQUIRED)
 
 CPMAddPackage(URI "gh:ricab/scope_guard@1.1.0" DOWNLOAD_ONLY ON)
+CPMAddPackage(NAME tinyexpr-plusplus GIT_REPOSITORY "https://github.com/Blake-Madden/tinyexpr-plusplus.git" GIT_TAG "tinyexpr++" DOWNLOAD_ONLY ON)
 CPMAddPackage(URI "gh:ptsouchlos/thread-pool#0.7.0"
     OPTIONS
     "TP_BUILD_TESTS OFF"
@@ -87,6 +88,13 @@ if (scope_guard_ADDED)
     add_library(scope_guard INTERFACE)
     target_include_directories(scope_guard INTERFACE ${scope_guard_SOURCE_DIR})
     add_library(scope_guard::scope_guard ALIAS scope_guard)
+endif ()
+
+if (tinyexpr-plusplus_ADDED)
+    add_library(tinyexpr STATIC ${tinyexpr-plusplus_SOURCE_DIR}/tinyexpr.cpp)
+    target_include_directories(tinyexpr PUBLIC ${tinyexpr-plusplus_SOURCE_DIR})
+    target_compile_features(tinyexpr PRIVATE cxx_std_20)
+    add_library(tinyexpr::tinyexpr ALIAS tinyexpr)
 endif ()
 
 if (imgui_ADDED)
@@ -173,7 +181,14 @@ elseif (PHYS_IS_MSVC)
     target_link_options(phys PRIVATE /MANIFEST:NO $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
 endif ()
 
-target_link_libraries(phys PRIVATE scope_guard::scope_guard dp::thread-pool SDL3::SDL3-static imgui::imgui box2d::box2d $<$<BOOL:${PHYS_IS_WINDOWS}>:dwmapi>)
+target_link_libraries(phys PRIVATE
+    scope_guard::scope_guard
+    tinyexpr::tinyexpr
+    dp::thread-pool
+    SDL3::SDL3-static
+    imgui::imgui
+    box2d::box2d
+    $<$<BOOL:${PHYS_IS_WINDOWS}>:dwmapi>)
 
 # Install rules (used by Flatpak and system installs).
 include(GNUInstallDirs)
