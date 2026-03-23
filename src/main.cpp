@@ -72,18 +72,18 @@ int           g_window_w{};      // Window width in pixels.
 int           g_window_h{};      // Window height in pixels.
 
 // Graphics.
-int    g_fps_cap = 0;                           // 0 = off, 10-1000 = target FPS. Defaults to monitor refresh rate at init.
-int    g_vsync   = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
-Uint64 g_frame_start_ns{};                      // Counter at start of frame (Nanoseconds since SDL initialization).
-float  g_physics_ms{};                          // Last frame's physics time.
-float  g_render_ms{};                           // Last frame's render time (draw list build).
-float  g_present_ms{};                          // Last frame's GPU submit + present time.
-float  g_frame_ms{};                            // Last frame's total time.
-int    g_total_vertices{};                      // Last frame's total vertex count.
-int    g_total_indices{};                       // Last frame's total index count.
-int    g_frame_count{};                         // Frames counted in current second.
-Uint64 g_fps_timer_ns{};                        // Timestamp of last FPS update.
-int    g_display_fps{};                         // FPS shown on screen, updated once per second.
+int    g_fps_cap{};                           // 0 = off, 10-1000 = target FPS. Defaults to monitor refresh rate at init.
+int    g_vsync = SDL_RENDERER_VSYNC_ADAPTIVE; // Falls back to regular vsync if unsupported.
+Uint64 g_frame_start_ns{};                    // Counter at start of frame (Nanoseconds since SDL initialization).
+float  g_physics_ms{};                        // Last frame's physics time.
+float  g_render_ms{};                         // Last frame's render time (draw list build).
+float  g_present_ms{};                        // Last frame's GPU submit + present time.
+float  g_frame_ms{};                          // Last frame's total time.
+int    g_total_vertices{};                    // Last frame's total vertex count.
+int    g_total_indices{};                     // Last frame's total index count.
+int    g_frame_count{};                       // Frames counted in current second.
+Uint64 g_fps_timer_ns{};                      // Timestamp of last FPS update.
+int    g_display_fps{};                       // FPS shown on screen, updated once per second.
 
 // Camera.
 auto   g_camera_zoom_min = 1.0f;         // Minimum zoom level (clamped to keep viewport inside world bounds).
@@ -98,11 +98,13 @@ std::uint32_t                      g_worker_count{};     // Thread pool worker c
 std::unique_ptr<dp::thread_pool<>> g_thread_pool{};      // Box2D task thread pool.
 std::int32_t                       g_task_count{};       // Active Box2D tasks in `g_task_storage`.
 
+// Synchronization handle for a Box2D parallel task.
+// Placement-new'd into `g_task_storage`; the latch counts down as workers complete sub-ranges.
 struct TaskHandle
 {
     explicit TaskHandle(std::int32_t count) noexcept : done{count} {}
 
-    std::latch done;
+    std::latch done; // Workers count down; `finish_task` blocks until zero.
 };
 
 alignas(TaskHandle) std::byte g_task_storage[MAX_TASKS][sizeof(TaskHandle)]; // Placement-new storage for `TaskHandle` instances.
@@ -121,7 +123,8 @@ auto         g_random_damping = 0.02f; // Max random offset added to base drag p
 std::size_t  g_culled_count{};         // Bodies culled from rendering this frame (outside viewport).
 
 // Bodies.
-b2BodyId g_ground_id = b2_nullBodyId; // Static ground body (world boundary).
+b2BodyId g_ground_id     = b2_nullBodyId; // Static ground body (world boundary).
+auto     g_spawn_density = 1.0f;          // Density of newly spawned bodies. Higher = heavier, less bouncy.
 
 struct BodyState
 {
@@ -192,10 +195,10 @@ constexpr std::array ZONE_PRESETS = {
     FormulaPreset{"Turbulence", "sin(y * 3)", "cos(x * 3)"},
     FormulaPreset{"Saddle", "x", "-y"},
     FormulaPreset{"Dipole", "2*x*y / (r*r)", "(x*x - y*y) / (r*r)"},
+    FormulaPreset{"Custom", "", ""}, // Must always be last.
 };
 
-constexpr int ZONE_PRESET_COUNT  = (int)ZONE_PRESETS.size();
-constexpr int ZONE_PRESET_CUSTOM = ZONE_PRESET_COUNT; // Index used when formula text is manually edited.
+constexpr int ZONE_PRESET_CUSTOM = (int)ZONE_PRESETS.size() - 1; // Last entry — user-edited formulas.
 
 struct ForceZone
 {
@@ -206,9 +209,9 @@ struct ForceZone
     float        max_speed       = 30.0f; // Terminal velocity (m/s). Force scales to zero at this speed. 0 = unlimited.
     float        radius          = 5.0f;  // Area-of-effect (Circle).
     std::int32_t grid_resolution = 5;     // Arrow grid NxN resolution.
-    int          preset          = 0;     // Index into `ZONE_PRESETS`, or `ZONE_PRESET_CUSTOM` for user-edited.
-    ZoneShape    shape           = ZoneShape::Circle;
-    bool         active          = true;
+    int          preset{};                // Index into `ZONE_PRESETS`, or `ZONE_PRESET_CUSTOM` for user-edited.
+    ZoneShape    shape  = ZoneShape::Circle;
+    bool         active = true;
 
     // Formula fields evaluated per body via tinyexpr++.
     std::string formula_x = ZONE_PRESETS[0].formula_x; // X component of force direction.
@@ -223,64 +226,27 @@ struct ForceZone
     std::string formula_error{};                       // Error message from last failed compile.
 };
 
-// Compile formula expressions. Call when formula text changes.
-void compile_formulas(ForceZone &zone)
-{
-    zone.parser_x.set_variables_and_functions(
-        {{"x", &zone.bound_x}, {"y", &zone.bound_y}, {"r", &zone.bound_distance}, {"angle", &zone.bound_angle}});
-    zone.parser_y.set_variables_and_functions(
-        {{"x", &zone.bound_x}, {"y", &zone.bound_y}, {"r", &zone.bound_distance}, {"angle", &zone.bound_angle}});
-
-    auto ok_x          = zone.parser_x.compile(zone.formula_x);
-    auto ok_y          = zone.parser_y.compile(zone.formula_y);
-    zone.formula_valid = ok_x && ok_y;
-    if (!zone.formula_valid)
-    {
-        auto &failed = !ok_x ? zone.parser_x : zone.parser_y;
-        auto  msg    = failed.get_last_error_message();
-        auto  pos    = failed.get_last_error_position();
-        auto  label  = !ok_x ? "Fx" : "Fy";
-        if (!msg.empty())
-        {
-            zone.formula_error = std::format("{}: {} (col {})", label, msg, pos);
-        }
-        else if (pos >= 0)
-        {
-            zone.formula_error = std::format("{}: Error at col {}", label, pos);
-        }
-        else
-        {
-            zone.formula_error = std::format("{}: Invalid expression", label);
-        }
-    }
-}
-
-// Apply a preset by index. Fills formula strings and recompiles.
-void apply_zone_preset(ForceZone &zone, int index)
-{
-    zone.preset    = index;
-    zone.formula_x = ZONE_PRESETS[(std::size_t)index].formula_x;
-    zone.formula_y = ZONE_PRESETS[(std::size_t)index].formula_y;
-    compile_formulas(zone);
-}
-
 std::vector<ForceZone>     g_force_zones{};   // All active force zone regions.
 std::optional<std::size_t> g_dragging_zone{}; // Index of force zone being dragged, if any.
 
 // Ropes: Chain of capsule segments connected by revolute joints.
 struct Rope
 {
-    std::vector<b2BodyId>  segments{};             // Intermediate chain links.
-    std::vector<b2JointId> joints{};               // All joints (revolute + filter).
+    std::vector<b2BodyId>  segments{};        // Intermediate chain links.
+    std::vector<b2JointId> revolute_joints{}; // Structural joints connecting nodes in order: [anchor_a?->seg0, seg0->seg1, ..., seg(N-1)->anchor_b?].
+    std::vector<b2JointId> filter_joints{};   // Collision-disable joints between segments and anchors.
     b2BodyId               body_a = b2_nullBodyId; // Anchor body at start (null if dangling).
     b2BodyId               body_b = b2_nullBodyId; // Anchor body at end   (null if dangling).
     b2Vec2                 local_a{};              // Attach point in `body_a`'s local space.
     b2Vec2                 local_b{};              // Attach point in `body_b`'s local space.
+    float                  break_force{};          // Force threshold (N) for this rope. 0 = unbreakable.
 };
 
 std::vector<Rope> g_ropes{};                         // All ropes (intact and cut halves).
 b2BodyId          g_rope_start_body = b2_nullBodyId; // First body clicked when creating a rope.
 b2Vec2            g_rope_start_anchor{};             // Local-space attach point on rope start body.
+auto              g_rope_break_force = 500.0f;       // Default break force (N) for new ropes. 0 = unbreakable.
+bool              g_rope_stress_debug{};             // Show green/red joint stress overlay on ropes.
 
 // Pins: Revolute joint fixing a body to the static ground.
 struct Pin
@@ -733,17 +699,20 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 void add_box(b2Vec2 position, float half_width, float half_height)
 {
-    auto random_offset     = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
-    auto body_def          = b2DefaultBodyDef();
-    body_def.type          = b2_dynamicBody;
-    body_def.position      = position;
-    body_def.linearDamping = g_linear_damping + random_offset;
+    auto random_offset      = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
+    auto body_def           = b2DefaultBodyDef();
+    body_def.type           = b2_dynamicBody;
+    body_def.position       = position;
+    body_def.linearDamping  = g_linear_damping + random_offset;
+    body_def.angularDamping = 0.05f;
 
     auto body = b2CreateBody(g_world, &body_def);
 
-    auto shape_def              = b2DefaultShapeDef();
-    shape_def.density           = 1.0f;
-    shape_def.material.friction = 0.3f;
+    auto restitution               = 0.2f * std::clamp(1.0f / g_spawn_density, 0.2f, 2.0f);
+    auto shape_def                 = b2DefaultShapeDef();
+    shape_def.density              = g_spawn_density;
+    shape_def.material.friction    = 0.3f;
+    shape_def.material.restitution = restitution;
 
     auto box      = b2MakeBox(half_width, half_height);
     auto shape_id = b2CreatePolygonShape(body, &shape_def, &box);
@@ -753,17 +722,20 @@ void add_box(b2Vec2 position, float half_width, float half_height)
 
 void add_circle(b2Vec2 position, float radius)
 {
-    auto random_offset     = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
-    auto body_def          = b2DefaultBodyDef();
-    body_def.type          = b2_dynamicBody;
-    body_def.position      = position;
-    body_def.linearDamping = g_linear_damping + random_offset;
+    auto random_offset      = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
+    auto body_def           = b2DefaultBodyDef();
+    body_def.type           = b2_dynamicBody;
+    body_def.position       = position;
+    body_def.linearDamping  = g_linear_damping + random_offset;
+    body_def.angularDamping = 0.05f;
 
     auto body = b2CreateBody(g_world, &body_def);
 
-    auto shape_def              = b2DefaultShapeDef();
-    shape_def.density           = 1.0f;
-    shape_def.material.friction = 0.3f;
+    auto restitution               = 0.3f * std::clamp(1.0f / g_spawn_density, 0.2f, 2.0f);
+    auto shape_def                 = b2DefaultShapeDef();
+    shape_def.density              = g_spawn_density;
+    shape_def.material.friction    = 0.3f;
+    shape_def.material.restitution = restitution;
 
     b2Circle circle{{}, radius};
     auto     shape_id = b2CreateCircleShape(body, &shape_def, &circle);
@@ -773,17 +745,20 @@ void add_circle(b2Vec2 position, float radius)
 
 void add_triangle(b2Vec2 position, float height)
 {
-    auto random_offset     = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
-    auto body_def          = b2DefaultBodyDef();
-    body_def.type          = b2_dynamicBody;
-    body_def.position      = position;
-    body_def.linearDamping = g_linear_damping + random_offset;
+    auto random_offset      = std::round(SDL_randf() * g_random_damping * 1000.0f) * 0.001f;
+    auto body_def           = b2DefaultBodyDef();
+    body_def.type           = b2_dynamicBody;
+    body_def.position       = position;
+    body_def.linearDamping  = g_linear_damping + random_offset;
+    body_def.angularDamping = 0.05f;
 
     auto body = b2CreateBody(g_world, &body_def);
 
-    auto shape_def              = b2DefaultShapeDef();
-    shape_def.density           = 1.0f;
-    shape_def.material.friction = 0.3f;
+    auto restitution               = 0.2f * std::clamp(1.0f / g_spawn_density, 0.2f, 2.0f);
+    auto shape_def                 = b2DefaultShapeDef();
+    shape_def.density              = g_spawn_density;
+    shape_def.material.friction    = 0.3f;
+    shape_def.material.restitution = restitution;
 
     // Equilateral triangle, centered at centroid.
     auto   half_base = height / std::sqrt(3.0f);
@@ -797,6 +772,56 @@ void add_triangle(b2Vec2 position, float height)
     auto shape_id = b2CreatePolygonShape(body, &shape_def, &polygon);
 
     g_bodies.emplace_back(body, shape_id, b2_polygonShape, BodyState{position, b2Rot_identity}, random_offset);
+}
+
+// Bind tinyexpr++ variables to a zone's fields. Must be called after construction or any move/reallocation that changes the `zone`'s address.
+void bind_zone_variables(ForceZone &zone)
+{
+    zone.parser_x.set_variables_and_functions(
+        {{"x", &zone.bound_x}, {"y", &zone.bound_y}, {"r", &zone.bound_distance}, {"angle", &zone.bound_angle}});
+    zone.parser_y.set_variables_and_functions(
+        {{"x", &zone.bound_x}, {"y", &zone.bound_y}, {"r", &zone.bound_distance}, {"angle", &zone.bound_angle}});
+}
+
+// Compile formula expressions. Call when formula text changes.
+// Assumes `bind_zone_variables` has already been called.
+void compile_formulas(ForceZone &zone)
+{
+    auto ok_x          = zone.parser_x.compile(zone.formula_x);
+    auto ok_y          = zone.parser_y.compile(zone.formula_y);
+    zone.formula_valid = ok_x && ok_y;
+    if (zone.formula_valid)
+    {
+        zone.formula_error.clear();
+    }
+    else
+    {
+        auto &failed = !ok_x ? zone.parser_x : zone.parser_y;
+        auto  msg    = failed.get_last_error_message();
+        auto  pos    = failed.get_last_error_position();
+        auto  label  = !ok_x ? "Fx" : "Fy";
+        if (!msg.empty())
+        {
+            zone.formula_error = std::format("{}: {} (col {})", label, msg, pos);
+        }
+        else if (pos >= 0)
+        {
+            zone.formula_error = std::format("{}: Error at col {}", label, pos);
+        }
+        else
+        {
+            zone.formula_error = std::format("{}: Invalid expression", label);
+        }
+    }
+}
+
+// Apply a preset by index. Fills formula strings and recompiles.
+void apply_zone_preset(ForceZone &zone, int index)
+{
+    zone.preset    = index;
+    zone.formula_x = ZONE_PRESETS[(std::size_t)index].formula_x;
+    zone.formula_y = ZONE_PRESETS[(std::size_t)index].formula_y;
+    compile_formulas(zone);
 }
 
 [[nodiscard]] DrawnLine create_drawn_line(std::vector<b2Vec2> points)
@@ -1031,10 +1056,11 @@ void tick_force_zones()
                 auto mass  = b2Body_GetMass(body);
                 auto force = b2RotateVector(context.angle_rotation, {fx, fy}) * (context.strength * mass);
 
-                // Edge fade for circular boundary.
+                // Smooth edge fade for circular boundary (smoothstep: 3t^2 - 2t^3).
                 if (context.shape == ZoneShape::Circle && context.radius > 0.0f)
                 {
-                    auto edge_fade = std::max(0.0f, 1.0f - distance / context.radius);
+                    auto t         = std::clamp(1.0f - distance / context.radius, 0.0f, 1.0f);
+                    auto edge_fade = t * t * (3.0f - 2.0f * t);
                     force          = force * edge_fade;
                 }
 
@@ -1047,8 +1073,9 @@ void tick_force_zones()
                         auto force_direction = force * (1.0f / std::sqrt(force_len_squared));
                         auto velocity        = b2Body_GetLinearVelocity(body);
                         auto speed_along     = b2Dot(velocity, force_direction);
-                        auto speed_fraction  = std::max(0.0f, speed_along) / context.max_speed;
-                        force                = force * std::max(0.0f, 1.0f - speed_fraction);
+                        auto speed_fraction  = std::clamp(std::max(0.0f, speed_along) / context.max_speed, 0.0f, 1.0f);
+                        auto damping         = 1.0f - speed_fraction * speed_fraction * (3.0f - 2.0f * speed_fraction);
+                        force                = force * damping;
                     }
                 }
 
@@ -1057,6 +1084,33 @@ void tick_force_zones()
                 return true;
             },
             &context);
+    }
+}
+
+// Break rope joints that exceed `g_rope_break_force`. Called after each physics step.
+void tick_rope_stress()
+{
+    for (auto &&rope : g_ropes)
+    {
+        if (rope.break_force <= 0.0f)
+        {
+            continue;
+        }
+
+        auto threshold_squared = rope.break_force * rope.break_force;
+        for (auto &&joint : rope.revolute_joints)
+        {
+            if (!b2Joint_IsValid(joint))
+            {
+                continue;
+            }
+
+            auto force = b2Joint_GetConstraintForce(joint);
+            if (b2LengthSquared(force) > threshold_squared)
+            {
+                b2DestroyJoint(joint);
+            }
+        }
     }
 }
 
@@ -1138,6 +1192,7 @@ void step_physics(float delta_time)
 
         tick_emitters(PHYSICS_DELTA_TIME * (float)g_step_count);
         tick_force_zones();
+        tick_rope_stress();
 
         g_single_step   = false;
         g_physics_alpha = 1.0f;
@@ -1158,6 +1213,7 @@ void step_physics(float delta_time)
 
         reset_tasks();
         b2World_Step(g_world, PHYSICS_DELTA_TIME, g_sub_steps);
+        tick_rope_stress();
 
         g_physics_accumulator -= PHYSICS_DELTA_TIME;
     }
@@ -1473,6 +1529,8 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             ImGui::EndDragDropSource();
         }
 
+        slider("Density", g_spawn_density, 0.1f, 10.0f, 0.1f, "%.1f kg/m^2");
+
         ImGui::SeparatorText("Selection");
 
         int selected_count{};
@@ -1546,23 +1604,26 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             if (ImGui::Button("Add Zone"))
             {
                 auto &zone = g_force_zones.emplace_back(g_camera_center);
+
+                // Reallocation invalidates bound variable pointers in all existing zones.
+                for (auto &&zone2 : g_force_zones)
+                {
+                    bind_zone_variables(zone2);
+                }
+
                 apply_zone_preset(zone, 0); // Default preset (Vortex).
             }
 
             // Build null-separated preset combo string once.
             static std::string preset_combo_items = []
             {
-                std::string items{};
-                for (std::size_t j{}; j < ZONE_PRESETS.size(); ++j)
+                std::string result{};
+                for (auto &&preset : ZONE_PRESETS)
                 {
-                    items += ZONE_PRESETS[j].name;
-                    items += '\0';
+                    result += std::string{preset.name} + '\0';
                 }
 
-                items += "Custom";
-                items += '\0';
-
-                return items;
+                return result;
             }();
 
             for (std::size_t i{}; i < g_force_zones.size(); ++i)
@@ -1581,10 +1642,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 zone.shape = (ZoneShape)shape_idx;
 
                 // Preset dropdown: selecting a preset fills formula fields.
-                int previous_preset = zone.preset;
-                combo("Preset", zone.preset, preset_combo_items.c_str(), ZONE_PRESET_COUNT + 1);
-
-                if (zone.preset != previous_preset && zone.preset < ZONE_PRESET_COUNT)
+                if (combo("Preset", zone.preset, preset_combo_items.c_str(), (int)ZONE_PRESETS.size()))
                 {
                     apply_zone_preset(zone, zone.preset);
                 }
@@ -1611,6 +1669,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                         }
                     }
                 }
+
                 if (!zone.formula_valid)
                 {
                     ImGui::TextColored({1.0f, 0.3f, 0.3f, 1.0f}, "%s", zone.formula_error.c_str());
@@ -1623,8 +1682,8 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
                 if (zone.shape == ZoneShape::Rectangle)
                 {
-                    slider("Width", zone.half_size.x, 0.5f, 20.0f, 0.5f, "%.1f m");
-                    slider("Height", zone.half_size.y, 0.5f, 20.0f, 0.5f, "%.1f m");
+                    slider("Width", zone.half_size.x, 0.5f, 30.0f, 0.5f, "%.1f m");
+                    slider("Height", zone.half_size.y, 0.5f, 30.0f, 0.5f, "%.1f m");
                 }
                 else
                 {
@@ -1633,13 +1692,19 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
                 slider("Strength", zone.strength, -500.0f, 500.0f, 5.0f, "%.1f m/s^2");
                 slider("Max Speed", zone.max_speed, 0.0f, 200.0f, 5.0f, "%.0f m/s");
-                slider("Arrows", zone.grid_resolution, 2, 15, 1);
+                slider("Resolution", zone.grid_resolution, 2, 25, 1);
                 slider("X", zone.position.x, -100.0f, 100.0f, 0.5f, "%.1f m");
                 slider("Y", zone.position.y, -40.0f, 120.0f, 0.5f, "%.1f m");
 
                 if (ImGui::Button("Remove"))
                 {
                     g_force_zones.erase(g_force_zones.begin() + (std::ptrdiff_t)i);
+
+                    // Erase moves trailing elements, invalidating their bound variable pointers.
+                    for (auto &&zone2 : g_force_zones)
+                    {
+                        bind_zone_variables(zone2);
+                    }
 
                     --i;
 
@@ -1694,6 +1759,9 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                     }
                 }
             }
+
+            slider("Rope Break Force", g_rope_break_force, 0.0f, 2000.0f, 25.0f, "%.0f N");
+            ImGui::Checkbox("Rope Stress Debug", &g_rope_stress_debug);
         }
 
         if (ImGui::CollapsingHeader("Info", ImGuiTreeNodeFlags_DefaultOpen))
@@ -1761,6 +1829,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             hint("Escape", "Clear selection / cancel");
             hint("Middle-click drag", "Pan camera");
             hint("Scroll wheel", "Zoom to cursor");
+            hint("Ctrl+Scroll / +/-", "Adjust hovered slider or combo");
             hint("Drag spawn button", "Place shape at cursor");
         }
     }
@@ -2137,40 +2206,48 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                 auto next     = points[i + 1];
                 auto after    = points[i + 1 < points.size() - 1 ? i + 2 : points.size() - 1];
 
-                // Catmull-Rom tangents, clamped to prevent overshoot at endpoints and sharp angles.
+                // Catmull-Rom tangents, clamped to prevent overshoot at sharp angles.
                 auto segment_direction = next - current;
                 auto segment_length    = b2Length(segment_direction);
+
+                // Measure bend angles at start and end of this segment.
+                auto prev_direction = current - previous;
+                auto next_direction = after - next;
+                auto prev_length    = b2Length(prev_direction);
+                auto next_len       = b2Length(next_direction);
+
+                // Cosine of angle between adjacent segments (1 = straight, 0 = 90°, -1 = fold-back).
+                auto start_cos =
+                    prev_length > 1e-6f && segment_length > 1e-6f ? b2Dot(prev_direction, segment_direction) / (prev_length * segment_length) : 1.0f;
+                auto end_cos =
+                    next_len > 1e-6f && segment_length > 1e-6f ? b2Dot(segment_direction, next_direction) / (segment_length * next_len) : 1.0f;
+
+                // At sharp bends (>60°), fall back to straight line.
+                if (start_cos < 0.5f || end_cos < 0.5f)
+                {
+                    background->PathLineTo(to_screen(next));
+
+                    continue;
+                }
 
                 // Start tangent.
                 auto tangent_start        = (next - previous) * (1.0f / 6.0f);
                 auto tangent_start_length = b2Length(tangent_start);
-                auto previous_length      = i > 0 ? b2Length(current - previous) : segment_length;
+                auto previous_length      = i > 0 ? prev_length : segment_length;
                 auto max_tangent_start    = std::min(segment_length, previous_length) * 0.5f;
                 if (tangent_start_length > max_tangent_start)
                 {
                     tangent_start = tangent_start * (max_tangent_start / tangent_start_length);
                 }
 
-                // Kill tangent if it opposes the segment direction (>90 degree bend).
-                if (segment_length > 1e-6f && b2Dot(tangent_start, segment_direction) < 0.0f)
-                {
-                    tangent_start = b2Vec2_zero;
-                }
-
                 // End tangent.
                 auto tangent_end        = (after - current) * (1.0f / 6.0f);
                 auto tangent_end_length = b2Length(tangent_end);
-                auto next_length        = i + 1 < points.size() - 1 ? b2Length(after - next) : segment_length;
+                auto next_length        = i + 1 < points.size() - 1 ? next_len : segment_length;
                 auto max_tangent_end    = std::min(segment_length, next_length) * 0.5f;
                 if (tangent_end_length > max_tangent_end)
                 {
                     tangent_end = tangent_end * (max_tangent_end / tangent_end_length);
-                }
-
-                // Kill tangent if it opposes the segment direction.
-                if (segment_length > 1e-6f && b2Dot(tangent_end, segment_direction) < 0.0f)
-                {
-                    tangent_end = b2Vec2_zero;
                 }
 
                 auto control_start = to_screen(current + tangent_start);
@@ -2212,7 +2289,15 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                         return false;
                     }
 
-                    for (auto &&joint : rope.joints)
+                    for (auto &&joint : rope.revolute_joints)
+                    {
+                        if (b2Joint_IsValid(joint))
+                        {
+                            b2DestroyJoint(joint);
+                        }
+                    }
+
+                    for (auto &&joint : rope.filter_joints)
                     {
                         if (b2Joint_IsValid(joint))
                         {
@@ -2233,48 +2318,121 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             for (auto &&rope : g_ropes)
             {
-                // Build point list: Anchor/tip A, segment centers, anchor/tip B.
-                // At dangling ends (cut rope), use the capsule tip instead of an anchor so the visual rope covers the full collision extent.
-                // `SEGMENT_HALF_LENGTH` (0.09) + `SEGMENT_RADIUS` (0.06) = `SEGMENT_TIP_OFFSET` (0.15).
-                std::vector<b2Vec2> points{};
-                points.reserve(rope.segments.size() + 2);
-
-                if (B2_IS_NON_NULL(rope.body_a))
-                {
-                    points.emplace_back(b2Body_GetWorldPoint(rope.body_a, rope.local_a));
-                }
-                else if (!rope.segments.empty())
-                {
-                    // Dangling start: Extend to the capsule tip.
-                    auto rotation = b2Body_GetRotation(rope.segments.front());
-                    points.emplace_back(b2Body_GetPosition(rope.segments.front()) + b2RotateVector(rotation, {0.0f, -SEGMENT_TIP_OFFSET}));
-                }
-
-                for (auto &&segment : rope.segments)
-                {
-                    points.emplace_back(b2Body_GetPosition(segment));
-                }
-
-                if (B2_IS_NON_NULL(rope.body_b))
-                {
-                    points.emplace_back(b2Body_GetWorldPoint(rope.body_b, rope.local_b));
-                }
-                else if (!rope.segments.empty())
-                {
-                    // Dangling end: Extend to the capsule tip.
-                    auto rotation = b2Body_GetRotation(rope.segments.back());
-                    points.emplace_back(b2Body_GetPosition(rope.segments.back()) + b2RotateVector(rotation, {0.0f, SEGMENT_TIP_OFFSET}));
-                }
-
-                if (points.size() < 2)
+                if (rope.segments.empty())
                 {
                     continue;
                 }
 
-                // Draw outline then fill using the Catmull-Rom path renderer.
-                render_smooth_line(points, ROPE_OUTLINE, rope_thickness + std::max(2.0f, 3.0f * std::sqrt(g_camera_zoom / ZOOM_DEFAULT)));
-                render_smooth_line(points, ROPE_COLOR, rope_thickness);
-            }
+                auto has_a         = B2_IS_NON_NULL(rope.body_a);
+                auto has_b         = B2_IS_NON_NULL(rope.body_b);
+                auto segment_count = (std::int32_t)rope.segments.size();
+
+                // Node list: [anchor_a?] [seg_0 .. seg_(N-1)] [anchor_b?].
+                // `revolute_joints[i]` connects nodes[i] to nodes[i+1] (1:1 by construction).
+                std::vector<b2Vec2> nodes{};
+                nodes.reserve(rope.segments.size() + 2);
+
+                if (has_a)
+                {
+                    nodes.emplace_back(b2Body_GetWorldPoint(rope.body_a, rope.local_a));
+                }
+                else
+                {
+                    auto rotation = b2Body_GetRotation(rope.segments.front());
+                    nodes.emplace_back(b2Body_GetPosition(rope.segments.front()) + b2RotateVector(rotation, {0.0f, -SEGMENT_TIP_OFFSET}));
+                }
+
+                for (auto &&segment : rope.segments)
+                {
+                    nodes.emplace_back(b2Body_GetPosition(segment));
+                }
+
+                if (has_b)
+                {
+                    nodes.emplace_back(b2Body_GetWorldPoint(rope.body_b, rope.local_b));
+                }
+                else
+                {
+                    auto rotation = b2Body_GetRotation(rope.segments.back());
+                    nodes.emplace_back(b2Body_GetPosition(rope.segments.back()) + b2RotateVector(rotation, {0.0f, SEGMENT_TIP_OFFSET}));
+                }
+
+                // Split into contiguous runs at broken (invalid) joints.
+                // At broken ends within the rope, extend to capsule tips so the visual covers the full collision shape.
+                auto         node_count = (std::int32_t)nodes.size();
+                auto         seg_offset = has_a ? 1 : 0; // Index offset from node index to segment index.
+                std::int32_t run_start{};
+                for (std::int32_t k = 1; k <= node_count; ++k)
+                {
+                    auto broken =
+                        k < node_count && (k - 1 >= (std::int32_t)rope.revolute_joints.size() || !b2Joint_IsValid(rope.revolute_joints[k - 1]));
+                    if (k == node_count || broken)
+                    {
+                        if (k - run_start >= 2)
+                        {
+                            std::vector points(nodes.begin() + run_start, nodes.begin() + k);
+
+                            // Extend dangling start: if the first point in this run is a segment center (not anchor_a).
+                            auto first_is_segment = run_start != 0 || !has_a;
+                            if (first_is_segment)
+                            {
+                                auto seg_idx = run_start - seg_offset;
+                                if (seg_idx >= 0 && seg_idx < segment_count)
+                                {
+                                    auto &current  = rope.segments[seg_idx];
+                                    auto  rotation = b2Body_GetRotation(current);
+                                    points.front() = b2Body_GetPosition(current) + b2RotateVector(rotation, {0.0f, -SEGMENT_TIP_OFFSET});
+                                }
+                            }
+
+                            // Extend dangling end: if the last point in this run is a segment center (not anchor_b).
+                            auto last_is_segment = k != node_count || !has_b;
+                            if (last_is_segment)
+                            {
+                                auto seg_idx = k - 1 - seg_offset;
+                                if (seg_idx >= 0 && seg_idx < segment_count)
+                                {
+                                    auto &current  = rope.segments[seg_idx];
+                                    auto  rotation = b2Body_GetRotation(current);
+                                    points.back()  = b2Body_GetPosition(current) + b2RotateVector(rotation, {0.0f, SEGMENT_TIP_OFFSET});
+                                }
+                            }
+
+                            render_smooth_line(points, ROPE_OUTLINE, rope_thickness + std::max(2.0f, 3.0f * std::sqrt(g_camera_zoom / ZOOM_DEFAULT)));
+                            render_smooth_line(points, ROPE_COLOR, rope_thickness);
+                        }
+
+                        run_start = k;
+                    }
+                }
+
+                // Debug stress overlay: Colored dots at each revolute joint position.
+                if (g_rope_stress_debug && rope.break_force > 0.0f)
+                {
+                    for (auto &&joint : rope.revolute_joints)
+                    {
+                        if (!b2Joint_IsValid(joint))
+                        {
+                            continue;
+                        }
+
+                        auto anchor   = b2Joint_GetLocalAnchorA(joint);
+                        auto body     = b2Joint_GetBodyA(joint);
+                        auto world_pt = b2Body_GetWorldPoint(body, anchor);
+                        auto screen   = to_screen(world_pt);
+
+                        auto force    = b2Joint_GetConstraintForce(joint);
+                        auto fraction = std::clamp(b2Length(force) / rope.break_force, 0.0f, 1.0f);
+
+                        // Green (safe) -> Yellow (mid) -> Red (near break).
+                        auto r = (std::uint8_t)(std::min(fraction * 2.0f, 1.0f) * 255.0f);
+                        auto g = (std::uint8_t)(std::min((1.0f - fraction) * 2.0f, 1.0f) * 255.0f);
+
+                        auto dot_radius = std::max(3.0f, g_camera_zoom * 0.1f);
+                        foreground->AddCircleFilled(screen, dot_radius, IM_COL32(r, g, 0, 200));
+                    }
+                }
+            } // end for each rope
 
             // Pending rope: Line from start anchor to cursor.
             if (B2_IS_NON_NULL(g_rope_start_body))
@@ -2595,7 +2753,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                                 revolute_def.localAnchorA = g_rope_start_anchor;
                                 revolute_def.localAnchorB = {0.0f, -SEGMENT_HALF_LENGTH};
 
-                                rope.joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
+                                rope.revolute_joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
                             }
 
                             // Segment-to-segment: Top tip of [i] -> bottom tip of [i+1].
@@ -2607,7 +2765,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                                 revolute_def.localAnchorA = {0.0f, SEGMENT_HALF_LENGTH};
                                 revolute_def.localAnchorB = {0.0f, -SEGMENT_HALF_LENGTH};
 
-                                rope.joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
+                                rope.revolute_joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
                             }
 
                             // Last segment top tip -> Anchor B.
@@ -2618,7 +2776,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                                 revolute_def.localAnchorA = {0.0f, SEGMENT_HALF_LENGTH};
                                 revolute_def.localAnchorB = anchor_end;
 
-                                rope.joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
+                                rope.revolute_joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
                             }
 
                             // Disable collision between rope segments and their anchor bodies.
@@ -2628,19 +2786,20 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                                 filter_def_start.bodyIdA = g_rope_start_body;
                                 filter_def_start.bodyIdB = segment;
 
-                                rope.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_start));
+                                rope.filter_joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_start));
 
                                 auto filter_def_end    = b2DefaultFilterJointDef();
                                 filter_def_end.bodyIdA = target_body;
                                 filter_def_end.bodyIdB = segment;
 
-                                rope.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_end));
+                                rope.filter_joints.emplace_back(b2CreateFilterJoint(g_world, &filter_def_end));
                             }
 
-                            rope.body_a  = g_rope_start_body;
-                            rope.body_b  = target_body;
-                            rope.local_a = g_rope_start_anchor;
-                            rope.local_b = anchor_end;
+                            rope.body_a      = g_rope_start_body;
+                            rope.body_b      = target_body;
+                            rope.local_a     = g_rope_start_anchor;
+                            rope.local_b     = anchor_end;
+                            rope.break_force = g_rope_break_force;
 
                             g_ropes.emplace_back(std::move(rope));
                         }
@@ -3024,7 +3183,14 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 }
 
                 // Destroy all joints and segment bodies.
-                for (auto &&joint : rope.joints)
+                for (auto &&joint : rope.revolute_joints)
+                {
+                    if (b2Joint_IsValid(joint))
+                    {
+                        b2DestroyJoint(joint);
+                    }
+                }
+                for (auto &&joint : rope.filter_joints)
                 {
                     if (b2Joint_IsValid(joint))
                     {
@@ -3059,6 +3225,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 auto  anchor_end    = rope.local_b;
                 auto  has_start     = B2_IS_NON_NULL(body_a);
                 auto  has_end       = B2_IS_NON_NULL(body_b);
+                auto  break_force   = rope.break_force;
 
                 // Inline hit-test: Walk the chain [anchor_a?, segments..., anchor_b?] without allocating.
                 std::optional<std::int32_t> hit_link{};
@@ -3105,7 +3272,15 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 }
 
                 // Destroy all joints.
-                for (auto &&joint : rope.joints)
+                for (auto &&joint : rope.revolute_joints)
+                {
+                    if (b2Joint_IsValid(joint))
+                    {
+                        b2DestroyJoint(joint);
+                    }
+                }
+
+                for (auto &&joint : rope.filter_joints)
                 {
                     if (b2Joint_IsValid(joint))
                     {
@@ -3134,7 +3309,8 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
 
                 // Wire a sub-rope from existing segment bodies and push to `g_ropes`.
                 // `anchor_first`: true = `anchor` is `body_a` (left half), false = `body_b` (right half).
-                auto wire_half = [&make_rev](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segment_data, std::int32_t count, bool anchor_first)
+                auto wire_half =
+                    [&make_rev, break_force](b2BodyId anchor, b2Vec2 anchor_local, b2BodyId *segment_data, std::int32_t count, bool anchor_first)
                 {
                     Rope half{};
                     half.segments.assign(segment_data, segment_data + count);
@@ -3147,12 +3323,12 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                         {
                             half.body_a  = anchor;
                             half.local_a = anchor_local;
-                            half.joints.emplace_back(make_rev(anchor, anchor_local, half.segments.front(), {0.0f, -SEGMENT_HALF_LENGTH}));
+                            half.revolute_joints.emplace_back(make_rev(anchor, anchor_local, half.segments.front(), {0.0f, -SEGMENT_HALF_LENGTH}));
                         }
 
                         for (std::int32_t j{}; j < count - 1; ++j)
                         {
-                            half.joints.emplace_back(
+                            half.revolute_joints.emplace_back(
                                 make_rev(half.segments[j], {0.0f, SEGMENT_HALF_LENGTH}, half.segments[j + 1], {0.0f, -SEGMENT_HALF_LENGTH}));
                         }
                     }
@@ -3160,7 +3336,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     {
                         for (std::int32_t j{}; j < count - 1; ++j)
                         {
-                            half.joints.emplace_back(
+                            half.revolute_joints.emplace_back(
                                 make_rev(half.segments[j], {0.0f, SEGMENT_HALF_LENGTH}, half.segments[j + 1], {0.0f, -SEGMENT_HALF_LENGTH}));
                         }
 
@@ -3168,7 +3344,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                         {
                             half.body_b  = anchor;
                             half.local_b = anchor_local;
-                            half.joints.emplace_back(make_rev(half.segments.back(), {0.0f, SEGMENT_HALF_LENGTH}, anchor, anchor_local));
+                            half.revolute_joints.emplace_back(make_rev(half.segments.back(), {0.0f, SEGMENT_HALF_LENGTH}, anchor, anchor_local));
                         }
                     }
 
@@ -3180,10 +3356,11 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                             filter_joint_def.bodyIdA = anchor;
                             filter_joint_def.bodyIdB = half.segments[j];
 
-                            half.joints.emplace_back(b2CreateFilterJoint(g_world, &filter_joint_def));
+                            half.filter_joints.emplace_back(b2CreateFilterJoint(g_world, &filter_joint_def));
                         }
                     }
 
+                    half.break_force = break_force;
                     g_ropes.emplace_back(std::move(half));
                 };
 

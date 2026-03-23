@@ -1,6 +1,6 @@
 # phys
 
-2D physics sandbox. Single-file C++23 application (`src/main.cpp`, ~3300 lines).
+2D physics sandbox. Single-file C++23 application (`src/main.cpp`, ~3480 lines).
 Spawn rigid bodies, draw collision geometry, link bodies with ropes, cut/erase ropes, pin bodies in place, and apply formula-driven force zones.
 
 ## Project layout
@@ -78,7 +78,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 10. Visual overlays: box-select rectangle, rope cut line (red), rope erase circle (red).
 11. Render bodies to background draw list — shape queries hoisted once per body, frustum culled, fill AA disabled (~2x vertex savings), outer outline retains AA.
 12. Render drawn lines (Catmull-Rom smoothed).
-13. Render ropes (Catmull-Rom, tangent kill at >90° bends, outline + fill).
+13. Render ropes (Catmull-Rom, straight-line fallback at >60\u00b0 bends, joint-validity splitting for broken ropes, outline + fill, optional stress debug overlay).
 14. Render pins (Phillips-head screw, `sqrt(zoom_ratio)` scaling).
 15. Render force zones (boundary + arrow grid).
 16. Render emitters (arrow + circle).
@@ -103,7 +103,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | Escape | Clear selection / cancel pending rope |
 | Middle-click drag | Pan camera |
 | Scroll wheel | Zoom to cursor |
-
+| Ctrl+Scroll / +/- | Adjust hovered slider or combo |
 ## Types
 
 ### Enums
@@ -120,7 +120,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `DrawnLine` | Static body + polyline points for freehand collision geometry |
 | `Emitter` | Position, angle, speed, rate, timer, shape type, active flag |
 | `ForceZone` | Position, shape, radius/half_size, angle, strength, max_speed, formula strings, tinyexpr++ parsers, bound variables, preset index |
-| `Rope` | Capsule segment bodies + revolute joints + anchor body/local references |
+| `Rope` | Capsule segment bodies + `revolute_joints` (structural, ordered) + `filter_joints` (collision-disable) + anchor body/local references + `break_force` |
 | `Pin` | `b2JointId` + `b2BodyId` — revolute joint pinning body to ground |
 | `TaskHandle` | `std::latch` wrapper for Box2D parallel task completion |
 | `CoreTopology` | Platform-conditional: P-core IDs + total logical CPUs |
@@ -178,6 +178,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `g_linear_damping` | `float` | Base linear drag on all bodies (default 0.1) |
 | `g_random_damping` | `float` | Max random drag offset per body (default 0.02) |
 | `g_culled_count` | `size_t` | Bodies frustum-culled this frame |
+| `g_spawn_density` | `float` | Density of newly spawned bodies (default 1.0). Higher = heavier, less bouncy |
 
 ### Camera
 
@@ -215,6 +216,8 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `g_cut_start` | `ImVec2` | Cut line screen-space origin |
 | `g_just_pinned` | `bool` | Suppresses right-click selection after pin/unpin |
 | `g_just_cut` | `bool` | Limits to one rope cut per drag |
+| `g_rope_break_force` | `float` | Default break force (N) for new ropes. 0 = unbreakable (default 500) |
+| `g_rope_stress_debug` | `bool` | Show green/red joint stress overlay on breakable ropes |
 
 ### Constants
 
@@ -242,7 +245,7 @@ Run `clang-format` (v20, config in `.clang-format`) before committing.
 - Allman braces, 4-space indent, no tabs, 150-column limit, LF endings.
 - Right-aligned pointers/references: `int *p`, `float &r`.
 - `auto` for locals. `auto` with suffix for float globals (e.g. `auto g_foo = 0.1f`).
-- `int` only for `g_window_w` / `g_window_h` (SDL API match). Otherwise `std::int32_t` / `std::uint32_t` / `std::size_t`.
+- `int` for ImGui-facing fields (combo indices, slider ints, `g_window_w`/`g_window_h`). Otherwise `std::int32_t` / `std::uint32_t` / `std::size_t`.
 - Globals: `g_snake_case`. Constants/constexpr: `UPPER_SNAKE_CASE`. Functions: `snake_case`.
 - Includes: third-party first, then stdlib sorted alphabetically. Manual sort (`SortIncludes: Never`).
 - `emplace_back` over `push_back`. `= {}` over `.reset()` for optionals.
@@ -264,17 +267,23 @@ Run `clang-format` (v20, config in `.clang-format`) before committing.
 - **Coordinate transforms**: `screen_to_world()` function and `to_screen` lambda in render block.
 - **Ground**: static body at y=-1, 160m wide, 1m tall.
 - **Polygon rendering**: expand vertices by shape radius along bisectors, inset for fill (edge rim). Shrink by `B2_LINEAR_SLOP` so shapes look flush. Outer outline gets AA fill; inner fill skips AA.
-- **Rope segments**: capsules with `linearDamping=0.5`, `angularDamping=2.0`. Revolute joints at tips. Filter joints prevent anchor-segment collision.
-- **Rope pruning**: checks anchor body validity each frame. Dead anchors → destroy orphan segments + joints.
-- **Rope cutting** (`wire_half` lambda): splits segments into two half-ropes, rewires revolute joints. Guards null anchors. One cut per drag (`g_just_cut`).
-- **Rope erasing**: inline hit-test with `previous_point` tracking (zero allocation). Destroys entire rope.
-- **Force zones are formula-driven**: All zone types (Vortex, Radial, Uniform, Turbulence, etc.) are presets that fill `formula_x`/`formula_y` strings. Evaluated per body via TinyExpr++ with bound variables `x`, `y` (relative to center), `r` (distance), `angle` (atan2). Preset dropdown auto-matches when user edits formula text to a known preset. `Context` struct passes zone pointer for formula evaluation in overlap callback.
+- **Rope segments**: capsules with `linearDamping=0.5`, `angularDamping=2.0`. `revolute_joints` (structural, 1:1 with node links) and `filter_joints` (collision-disable) stored separately. Per-rope `break_force` stamped from `g_rope_break_force` at creation. 0 = unbreakable.
+- **Rope pruning**: checks anchor body validity each frame. Dead anchors → destroy orphan segments + joints (both vectors).
+- **Rope cutting** (`wire_half` lambda): splits segments into two half-ropes, rewires revolute and filter joints separately. Propagates `break_force`. Guards null anchors. One cut per drag (`g_just_cut`).
+- **Rope erasing**: inline hit-test with `previous_point` tracking (zero allocation). Destroys entire rope (both joint vectors).
+- **Rope stress breaking** (`tick_rope_stress`): After each `b2World_Step`, checks `revolute_joints` on breakable ropes. `b2LengthSquared(force) > threshold²` avoids sqrt. `b2DestroyJoint` on overstressed joints.
+- **Rope rendering**: Joint-validity-based splitting into contiguous runs. Capsule tip extension at broken internal endpoints. Catmull-Rom with straight-line fallback at >60° bends.
+- **Rope stress debug overlay**: Green→Yellow→Red dots at revolute joint positions. `fraction = force / break_force`. Dot radius scales with camera zoom.
+- **Force zones are formula-driven**: All zone types (Vortex, Radial, Uniform, Turbulence, etc.) are presets that fill `formula_x`/`formula_y` strings. Custom is a real array entry (`ZONE_PRESET_CUSTOM = ZONE_PRESETS.size() - 1`) with empty formulas. Evaluated per body via TinyExpr++ with bound variables `x`, `y` (relative to center), `r` (distance), `angle` (atan2). Preset dropdown auto-matches when user edits formula text to a known preset.
+- **Force zone variable binding** (`bind_zone_variables`): Binds `double*` pointers into `te_parser`. Must be called after any `emplace_back` or `erase` on `g_force_zones` (vector reallocation/move invalidates pointers). Separate from `compile_formulas` which only recompiles expression text.
+- **Force zone edge fade**: Smoothstep (`3t²-2t³`) for circular boundary — zero derivative at boundary, no force jerk. Max-speed ramp also smoothstep.
 - **Force zone arrow rendering**: Grid-sampled formula evaluation, normalized for direction. Arrows flip for negative strength. Bodies/arrows within `1e-3f` of center skipped (singularity). `#if PHYS_DEBUG` shows grid lines and evaluated values at each sample point.
 - **Shape queries hoisted**: `b2Shape_GetPolygon` / `b2Shape_GetCircle` called once per body per frame, reused for selection AABB + color + render.
 - **Single-step transform bug**: previous transforms saved inside the accumulator loop, not before.
-- **Catmull-Rom tangent kill**: when `b2Dot(tangent, segment_direction) < 0`, tangent zeroed to prevent vertex explosion.
+- **Catmull-Rom sharp-bend fallback**: At bends >60° (`cos < 0.5` between adjacent segment directions), falls back to `PathLineTo` instead of cubic Bezier. Replaces the old tangent-kill approach. Tangent magnitude still clamped to `min(segment, neighbor) * 0.5` for gentle curves.
 - **Adaptive vsync**: SDL does NOT auto-fallback. Code explicitly retries with vsync=1 on failure.
 - **Camera pixel-snapped**: `std::round()` on camera offset avoids subpixel blurriness.
 - **No `imgui.ini`**: `io.IniFilename = nullptr`. Layout not persisted.
 - **Renderer preference**: `direct3d12,direct3d11,direct3d,metal,vulkan,opengl,software`.
 - `maxContactPushSpeed` = `6.0f * b2GetLengthUnitsPerMeter()`.
+- **Body physics**: `angularDamping=0.05` on all spawned bodies. Restitution: 0.2 (box/triangle), 0.3 (circle), scaled inversely with `g_spawn_density` via `clamp(1/density, 0.2, 2.0)`. Density slider 0.1–10.0 in Spawn section.
