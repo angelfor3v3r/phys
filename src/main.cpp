@@ -40,21 +40,21 @@ enum class SpawnShape : std::uint8_t
 };
 
 // Constants.
-constexpr auto         PI                  = std::numbers::pi_v<float>; // Pi constant (float precision).
-constexpr auto         RAD_TO_DEG          = 180.0f / PI;               // Multiply radians to get degrees.
-constexpr auto         DEG_TO_RAD          = PI / 180.0f;               // Multiply degrees to get radians.
-constexpr std::int32_t MAX_TASKS           = 64;                        // Maximum concurrent Box2D tasks in flight.
-constexpr auto         MAX_FRAME_TIME      = 0.25f;                     // Clamp for frame delta to prevent spiral of death (seconds).
-constexpr auto         PHYSICS_DELTA_TIME  = 1.0f / 60.0f;              // Fixed physics timestep (seconds).
-constexpr auto         ZOOM_DEFAULT        = 30.0f;                     // Default camera zoom (pixels per world unit).
-constexpr auto         ZOOM_MAX            = 500.0f;                    // Maximum camera zoom.
-constexpr auto         ZOOM_FACTOR         = 1.1f;                      // Multiplicative zoom per scroll tick.
-constexpr auto         MIN_STROKE_DIST     = 0.15f;                     // Minimum distance between stroke points (world units).
-constexpr auto         HIT_RADIUS          = 0.15f;                     // Hit-test radius for rope cut/erase (world units).
-constexpr auto         HIT_RADIUS_SQUARED  = HIT_RADIUS * HIT_RADIUS;   // Squared hit-test radius (avoids sqrt in distance checks).
-constexpr auto         SEGMENT_RADIUS      = 0.06f;                     // Rope capsule segment collision radius.
-constexpr auto         SEGMENT_SPACING     = 0.15f;                     // Distance between rope segment centers.
-constexpr auto         SEGMENT_HALF_LENGTH = SEGMENT_SPACING * 0.6f;    // Capsule half-length (>0.5x spacing so adjacent capsules overlap).
+constexpr auto         PI                  = std::numbers::pi_v<float>;            // Pi constant (float precision).
+constexpr auto         RAD_TO_DEG          = 180.0f / PI;                          // Multiply radians to get degrees.
+constexpr auto         DEG_TO_RAD          = PI / 180.0f;                          // Multiply degrees to get radians.
+constexpr std::int32_t MAX_TASKS           = 64;                                   // Maximum concurrent Box2D tasks in flight.
+constexpr auto         MAX_FRAME_TIME      = 0.25f;                                // Clamp for frame delta to prevent spiral of death (seconds).
+constexpr auto         PHYSICS_DELTA_TIME  = 1.0f / 60.0f;                         // Fixed physics timestep (seconds).
+constexpr auto         ZOOM_DEFAULT        = 30.0f;                                // Default camera zoom (pixels per world unit).
+constexpr auto         ZOOM_MAX            = 500.0f;                               // Maximum camera zoom.
+constexpr auto         ZOOM_FACTOR         = 1.1f;                                 // Multiplicative zoom per scroll tick.
+constexpr auto         MIN_STROKE_DIST     = 0.15f;                                // Minimum distance between stroke points (world units).
+constexpr auto         HIT_RADIUS          = 0.15f;                                // Hit-test radius for rope cut/erase (world units).
+constexpr auto         HIT_RADIUS_SQUARED  = HIT_RADIUS * HIT_RADIUS;              // Squared hit-test radius (avoids sqrt in distance checks).
+constexpr auto         SEGMENT_RADIUS      = 0.10f;                                // Rope capsule segment collision radius.
+constexpr auto         SEGMENT_HALF_LENGTH = 0.15f;                                // Capsule half-length.
+constexpr auto         SEGMENT_SPACING     = SEGMENT_HALF_LENGTH * 2.0f;           // Distance between rope segment centers (taut chain = no slack).
 constexpr auto         SEGMENT_TIP_OFFSET  = SEGMENT_HALF_LENGTH + SEGMENT_RADIUS; // Distance from segment center to capsule tip.
 
 // Playground bounds (world units).
@@ -115,7 +115,7 @@ b2WorldId    g_world = b2_nullWorldId; // Box2D physics world.
 bool         g_paused{};               // Simulation paused.
 bool         g_single_step{};          // Advance one physics step then re-pause.
 std::int32_t g_step_count = 1;         // Physics steps per frame.
-std::int32_t g_sub_steps  = 4;         // Box2D solver sub-steps per step.
+std::int32_t g_sub_steps  = 6;         // Box2D solver sub-steps per step.
 float        g_physics_alpha{};        // Interpolation factor between previous and current physics state.
 float        g_physics_accumulator{};  // Leftover time from previous frame for fixed-step integration.
 auto         g_linear_damping = 0.1f;  // Base linear drag applied to every dynamic body.
@@ -267,6 +267,7 @@ bool                       g_just_cut{};                   // Limits rope cuttin
 ImVec2                     g_cut_start{};                  // Screen-space start point of rope cut drag.
 bool                       g_erasing{};                    // Ctrl+Right-drag rope eraser active.
 std::optional<std::size_t> g_dragged_emitter{};            // Index of emitter being repositioned.
+b2Vec2                     g_drag_offset{};                // World-space offset from object center to grab point.
 bool                       g_just_pinned{};                // Suppresses right-click selection after pinning.
 
 [[nodiscard]] std::vector<std::byte> read_binary_file(std::string_view filename, std::size_t read_size = 0) noexcept
@@ -402,9 +403,10 @@ bool                       g_just_pinned{};                // Suppresses right-c
 // Box2D performs best on performance cores accessing a single L2 cache.
 // We detect P-cores (highest `EfficiencyClass` on Windows, highest `base_frequency` on Linux) and pin thread-pool workers to them. On homogeneous
 // CPUs all cores qualify.
-// TODO: On multi-CCD AMD chips (7950X3D, 9950X, Threadripper), further filter P-cores to the largest subset sharing an L3 cache.
+// TODO: On multi-CCD AMD chips (7950X3D, 9950X, Threadripper), further filter P-cores to the largest subset sharing an L3 cache/single CCD.
 //       Linux: `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`
 //       Windows: `GetLogicalProcessorInformationEx(RelationCache)` with `CacheLevel` == 3
+//       This is to avoid inter-CCD performance loss, but it needs testing.
 #if defined(_WIN32)
 #include <dwmapi.h>
 
@@ -477,7 +479,7 @@ void bind_thread_to_perf_cores(const std::vector<DWORD> &cpu_set_ids)
         return;
     }
 
-    SetThreadSelectedCpuSets(GetCurrentThread(), cpu_set_ids.data(), (ULONG)cpu_set_ids.size());
+    SetThreadSelectedCpuSets(GetCurrentThread(), (const ULONG *)cpu_set_ids.data(), (ULONG)cpu_set_ids.size());
 }
 #elif defined(__linux__)
 #include <sched.h>
@@ -515,16 +517,14 @@ struct CoreTopology
         return {};
     }
 
-    int num_cpus = (int)cpu_count; // Narrowing is safe; CPU count will never exceed INT_MAX.
-
     CoreTopology result{};
-    result.total_logical = (std::uint32_t)num_cpus;
+    result.total_logical = (std::uint32_t)cpu_count;
 
     // Strategy 1: Try sysfs cpu_type (modern kernels).
     // P-cores report "intel_core", E-cores report "intel_atom".
     // Non-hybrid or non-Intel CPUs may not have this file at all.
     std::vector<int> core_indices{};
-    for (int i{}; i < num_cpus; ++i)
+    for (int i{}; i < result.total_logical; ++i)
     {
         auto type = read_sysfs_text(std::format("/sys/devices/system/cpu/cpu{}/cpu_type", i));
         if (!type.empty() && !type.contains("atom"))
@@ -543,9 +543,9 @@ struct CoreTopology
     // Strategy 2: Compare base_frequency across CPUs.
     //   P-cores have higher base frequency than E-cores.
     std::vector<std::pair<int, long>> cpu_frequencies{};
-    cpu_frequencies.reserve(num_cpus);
+    cpu_frequencies.reserve(result.total_logical);
 
-    for (int i{}; i < num_cpus; ++i)
+    for (int i{}; i < result.total_logical; ++i)
     {
         auto text = read_sysfs_text(std::format("/sys/devices/system/cpu/cpu{}/cpufreq/base_frequency", i));
         if (text.empty())
@@ -586,7 +586,7 @@ struct CoreTopology
     }
 
     // Fallback: All CPUs are performance cores (homogeneous or unknown).
-    result.perf_cpu_indices.resize(num_cpus);
+    result.perf_cpu_indices.resize(result.total_logical);
     std::iota(result.perf_cpu_indices.begin(), result.perf_cpu_indices.end(), 0);
 
     return result;
@@ -611,7 +611,7 @@ void bind_thread_to_perf_cores(const std::vector<int> &cpu_indices)
 }
 #else
 // macOS / Other: No affinity control.
-// Apple Silicon hardcodes `ml_get_max_affinity_sets` to 0 (XNU arm64) - the Intel-era THREAD_AFFINITY_POLICY API` is non-functional.
+// Apple Silicon hardcodes `ml_get_max_affinity_sets` to 0 (XNU arm64) - the Intel-era `THREAD_AFFINITY_POLICY` API is non-functional.
 // QoS classes handle P/E core placement instead; default-QoS threads already land on P-cores under normal load.
 struct CoreTopology
 {
@@ -1529,7 +1529,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
             ImGui::EndDragDropSource();
         }
 
-        slider("Density", g_spawn_density, 0.1f, 10.0f, 0.1f, "%.1f kg/m^2");
+        slider("Density", g_spawn_density, 0.1f, 50.0f, 0.5f, "%.1f kg/m^2");
 
         ImGui::SeparatorText("Selection");
 
@@ -1744,7 +1744,7 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
 
             ImGui::EndDisabled();
 
-            slider("Sub-steps", g_sub_steps, 1, 8, 1);
+            slider("Sub-steps", g_sub_steps, 1, 12, 1);
 
             // Update all existing dynamic bodies when drag settings change.
             auto drag_changed   = slider("Drag", g_linear_damping, 0.0f, 5.0f, 0.1f, "%.2f");
@@ -2420,16 +2420,15 @@ SDL_AppResult SDL_AppIterate([[maybe_unused]] void *appstate)
                         auto body     = b2Joint_GetBodyA(joint);
                         auto world_pt = b2Body_GetWorldPoint(body, anchor);
                         auto screen   = to_screen(world_pt);
-
                         auto force    = b2Joint_GetConstraintForce(joint);
                         auto fraction = std::clamp(b2Length(force) / rope.break_force, 0.0f, 1.0f);
 
-                        // Green (safe) -> Yellow (mid) -> Red (near break).
-                        auto r = (std::uint8_t)(std::min(fraction * 2.0f, 1.0f) * 255.0f);
-                        auto g = (std::uint8_t)(std::min((1.0f - fraction) * 2.0f, 1.0f) * 255.0f);
+                        // Green (safe) -> Red (near break). Sqrt for perceptually smooth transition.
+                        auto red   = (std::uint8_t)(std::sqrt(fraction) * 255.0f);
+                        auto green = (std::uint8_t)(std::sqrt(1.0f - fraction) * 255.0f);
 
                         auto dot_radius = std::max(3.0f, g_camera_zoom * 0.1f);
-                        foreground->AddCircleFilled(screen, dot_radius, IM_COL32(r, g, 0, 200));
+                        foreground->AddCircleFilled(screen, dot_radius, IM_COL32(red, green, 0, 200));
                     }
                 }
             } // end for each rope
@@ -2745,39 +2744,35 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                             }
 
                             // Revolute joints: Connect capsule tips end-to-end.
-                            // Anchor A -> First segment bottom tip.
+                            // Helper: Configure shared rope revolute joint properties.
+                            auto make_rope_joint = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to) noexcept
                             {
                                 auto revolute_def         = b2DefaultRevoluteJointDef();
-                                revolute_def.bodyIdA      = g_rope_start_body;
-                                revolute_def.bodyIdB      = rope.segments.front();
-                                revolute_def.localAnchorA = g_rope_start_anchor;
-                                revolute_def.localAnchorB = {0.0f, -SEGMENT_HALF_LENGTH};
+                                revolute_def.bodyIdA      = body_from;
+                                revolute_def.bodyIdB      = body_to;
+                                revolute_def.localAnchorA = local_from;
+                                revolute_def.localAnchorB = local_to;
+                                revolute_def.enableSpring = true;
+                                revolute_def.hertz        = 30.0f;
+                                revolute_def.dampingRatio = 0.5f;
 
-                                rope.revolute_joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
-                            }
+                                return b2CreateRevoluteJoint(g_world, &revolute_def);
+                            };
+
+                            // Anchor A -> First segment bottom tip.
+                            rope.revolute_joints.emplace_back(
+                                make_rope_joint(g_rope_start_body, g_rope_start_anchor, rope.segments.front(), {0.0f, -SEGMENT_HALF_LENGTH}));
 
                             // Segment-to-segment: Top tip of [i] -> bottom tip of [i+1].
                             for (std::int32_t i{}; i < segment_count - 1; ++i)
                             {
-                                auto revolute_def         = b2DefaultRevoluteJointDef();
-                                revolute_def.bodyIdA      = rope.segments[i];
-                                revolute_def.bodyIdB      = rope.segments[i + 1];
-                                revolute_def.localAnchorA = {0.0f, SEGMENT_HALF_LENGTH};
-                                revolute_def.localAnchorB = {0.0f, -SEGMENT_HALF_LENGTH};
-
-                                rope.revolute_joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
+                                rope.revolute_joints.emplace_back(make_rope_joint(
+                                    rope.segments[i], {0.0f, SEGMENT_HALF_LENGTH}, rope.segments[i + 1], {0.0f, -SEGMENT_HALF_LENGTH}));
                             }
 
                             // Last segment top tip -> Anchor B.
-                            {
-                                auto revolute_def         = b2DefaultRevoluteJointDef();
-                                revolute_def.bodyIdA      = rope.segments.back();
-                                revolute_def.bodyIdB      = target_body;
-                                revolute_def.localAnchorA = {0.0f, SEGMENT_HALF_LENGTH};
-                                revolute_def.localAnchorB = anchor_end;
-
-                                rope.revolute_joints.emplace_back(b2CreateRevoluteJoint(g_world, &revolute_def));
-                            }
+                            rope.revolute_joints.emplace_back(
+                                make_rope_joint(rope.segments.back(), {0.0f, SEGMENT_HALF_LENGTH}, target_body, anchor_end));
 
                             // Disable collision between rope segments and their anchor bodies.
                             for (auto &&segment : rope.segments)
@@ -2830,6 +2825,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                     if (b2LengthSquared(world_point - g_emitters[i].position) <= EMITTER_GRAB_RADIUS * EMITTER_GRAB_RADIUS)
                     {
                         g_dragged_emitter = i;
+                        g_drag_offset     = g_emitters[i].position - world_point;
 
                         break;
                     }
@@ -2846,6 +2842,7 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                         if (distance_squared <= grab_radius * grab_radius)
                         {
                             g_dragging_zone = i;
+                            g_drag_offset   = zone.position - world_point;
 
                             break;
                         }
@@ -2864,8 +2861,8 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                         mouse_joint_def.bodyIdA      = g_ground_id;
                         mouse_joint_def.bodyIdB      = g_mouse_body;
                         mouse_joint_def.target       = world_point;
-                        mouse_joint_def.maxForce     = 10000.0f * b2Body_GetMass(g_mouse_body);
-                        mouse_joint_def.hertz        = 60.0f;
+                        mouse_joint_def.maxForce     = std::min(5000.0f, 1000.0f * b2Body_GetMass(g_mouse_body));
+                        mouse_joint_def.hertz        = 30.0f;
                         mouse_joint_def.dampingRatio = 1.0f;
 
                         g_mouse_joint = b2CreateMouseJoint(g_world, &mouse_joint_def);
@@ -3077,12 +3074,12 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
         else if (g_dragged_emitter)
         {
             auto world_point                        = screen_to_world(event->motion.x, event->motion.y);
-            g_emitters[*g_dragged_emitter].position = world_point;
+            g_emitters[*g_dragged_emitter].position = world_point + g_drag_offset;
         }
         else if (g_dragging_zone)
         {
             auto world_point                         = screen_to_world(event->motion.x, event->motion.y);
-            g_force_zones[*g_dragging_zone].position = world_point;
+            g_force_zones[*g_dragging_zone].position = world_point + g_drag_offset;
         }
         else if (B2_IS_NON_NULL(g_mouse_joint))
         {
@@ -3295,14 +3292,17 @@ SDL_AppResult SDL_AppEvent([[maybe_unused]] void *appstate, SDL_Event *event)
                 auto left_count  = cut_index;
                 auto right_count = segment_count - cut_index;
 
-                // Helper: Create a revolute joint between two bodies.
-                auto make_rev = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to)
+                // Helper: Create a rope revolute joint with spring + angle limit.
+                auto make_rev = [](b2BodyId body_from, b2Vec2 local_from, b2BodyId body_to, b2Vec2 local_to) noexcept
                 {
                     auto revolute_def         = b2DefaultRevoluteJointDef();
                     revolute_def.bodyIdA      = body_from;
                     revolute_def.bodyIdB      = body_to;
                     revolute_def.localAnchorA = local_from;
                     revolute_def.localAnchorB = local_to;
+                    revolute_def.enableSpring = true;
+                    revolute_def.hertz        = 30.0f;
+                    revolute_def.dampingRatio = 0.5f;
 
                     return b2CreateRevoluteJoint(g_world, &revolute_def);
                 };

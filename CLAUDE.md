@@ -104,6 +104,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | Middle-click drag | Pan camera |
 | Scroll wheel | Zoom to cursor |
 | Ctrl+Scroll / +/- | Adjust hovered slider or combo |
+
 ## Types
 
 ### Enums
@@ -174,7 +175,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `g_paused` | `bool` | Simulation paused |
 | `g_single_step` | `bool` | Advance one step then re-pause |
 | `g_step_count` | `int32_t` | Physics steps per frame (default 1) |
-| `g_sub_steps` | `int32_t` | Box2D solver sub-steps (default 4) |
+| `g_sub_steps` | `int32_t` | Box2D solver sub-steps (default 6) |
 | `g_linear_damping` | `float` | Base linear drag on all bodies (default 0.1) |
 | `g_random_damping` | `float` | Max random drag offset per body (default 0.02) |
 | `g_culled_count` | `size_t` | Bodies frustum-culled this frame |
@@ -218,6 +219,7 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `g_just_cut` | `bool` | Limits to one rope cut per drag |
 | `g_rope_break_force` | `float` | Default break force (N) for new ropes. 0 = unbreakable (default 500) |
 | `g_rope_stress_debug` | `bool` | Show green/red joint stress overlay on breakable ropes |
+| `g_drag_offset` | `b2Vec2` | World-space offset from object center to grab point (shared by emitter/zone drag) |
 
 ### Constants
 
@@ -231,9 +233,9 @@ All dependencies fetched via CPM — no manual installs. Set `CPM_SOURCE_CACHE` 
 | `MAX_FRAME_TIME` | 0.25 | Spiral-of-death clamp (seconds) |
 | `MIN_STROKE_DIST` | 0.15 | Min distance between stroke points |
 | `HIT_RADIUS` | 0.15 | Rope cut/erase hit-test radius |
-| `SEGMENT_RADIUS` | 0.06 | Rope capsule collision radius |
-| `SEGMENT_SPACING` | 0.15 | Distance between rope segment centers |
-| `SEGMENT_HALF_LENGTH` | spacing × 0.6 | Capsule half-length (overlap) |
+| `SEGMENT_RADIUS` | 0.10 | Rope capsule collision radius |
+| `SEGMENT_HALF_LENGTH` | 0.15 | Capsule half-length |
+| `SEGMENT_SPACING` | 2 × half_length | Distance between rope segment centers (taut chain = no slack) |
 | `SEGMENT_TIP_OFFSET` | half_length + radius | Center to capsule tip |
 | `AREA_MIN/MAX_X` | -100 / 100 | Playground X bounds |
 | `AREA_MIN/MAX_Y` | -40 / 120 | Playground Y bounds |
@@ -250,7 +252,7 @@ Run `clang-format` (v20, config in `.clang-format`) before committing.
 - Includes: third-party first, then stdlib sorted alphabetically. Manual sort (`SortIncludes: Never`).
 - `emplace_back` over `push_back`. `= {}` over `.reset()` for optionals.
 - C-style casts preferred. Windows `BOOL`: check `== FALSE` / `!= FALSE`, not `!`.
-- `noexcept` on pure-computation functions/lambdas. NOT on allocating or Box2D-create functions.
+- `noexcept` on pure-computation functions/lambdas and C API wrappers that cannot throw. NOT on functions that allocate (`std::vector`, `std::string`).
 - `[[nodiscard]]` on non-void free functions.
 - `auto &&` in all range-for loops.
 - `slider()` / `combo()` wrappers instead of raw ImGui widgets (they combine widget + scroll_adjust).
@@ -267,7 +269,7 @@ Run `clang-format` (v20, config in `.clang-format`) before committing.
 - **Coordinate transforms**: `screen_to_world()` function and `to_screen` lambda in render block.
 - **Ground**: static body at y=-1, 160m wide, 1m tall.
 - **Polygon rendering**: expand vertices by shape radius along bisectors, inset for fill (edge rim). Shrink by `B2_LINEAR_SLOP` so shapes look flush. Outer outline gets AA fill; inner fill skips AA.
-- **Rope segments**: capsules with `linearDamping=0.5`, `angularDamping=2.0`. `revolute_joints` (structural, 1:1 with node links) and `filter_joints` (collision-disable) stored separately. Per-rope `break_force` stamped from `g_rope_break_force` at creation. 0 = unbreakable.
+- **Rope segments**: capsules with `linearDamping=0.5`, `angularDamping=2.0`. Revolute joints have `enableSpring=true` (hertz=30, dampingRatio=0.5) for natural bend resistance. `revolute_joints` (structural, 1:1 with node links) and `filter_joints` (collision-disable) stored separately. Per-rope `break_force` stamped from `g_rope_break_force` at creation. 0 = unbreakable. Spacing = `2 * SEGMENT_HALF_LENGTH` (taut on creation, no slack). Mouse joint capped at `min(5000, 1000 * mass)` to limit rope stretch.
 - **Rope pruning**: checks anchor body validity each frame. Dead anchors → destroy orphan segments + joints (both vectors).
 - **Rope cutting** (`wire_half` lambda): splits segments into two half-ropes, rewires revolute and filter joints separately. Propagates `break_force`. Guards null anchors. One cut per drag (`g_just_cut`).
 - **Rope erasing**: inline hit-test with `previous_point` tracking (zero allocation). Destroys entire rope (both joint vectors).
@@ -286,4 +288,5 @@ Run `clang-format` (v20, config in `.clang-format`) before committing.
 - **No `imgui.ini`**: `io.IniFilename = nullptr`. Layout not persisted.
 - **Renderer preference**: `direct3d12,direct3d11,direct3d,metal,vulkan,opengl,software`.
 - `maxContactPushSpeed` = `6.0f * b2GetLengthUnitsPerMeter()`.
-- **Body physics**: `angularDamping=0.05` on all spawned bodies. Restitution: 0.2 (box/triangle), 0.3 (circle), scaled inversely with `g_spawn_density` via `clamp(1/density, 0.2, 2.0)`. Density slider 0.1–10.0 in Spawn section.
+- **Body physics**: `angularDamping=0.05` on all spawned bodies. Restitution: 0.2 (box/triangle), 0.3 (circle), scaled inversely with `g_spawn_density` via `clamp(1/density, 0.2, 2.0)`. Density slider 0.1–50.0 in Spawn section.
+- **Emitter/zone dragging**: `g_drag_offset` stores world-space offset from object center to grab point. Dragged objects follow cursor without snapping to center.
