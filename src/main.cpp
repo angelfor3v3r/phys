@@ -1360,7 +1360,7 @@ SDL_AppResult SDL_AppInit([[maybe_unused]] void **appstate, [[maybe_unused]] std
     world_def.userTaskContext = g_thread_pool.get();
 
     // Raise overlap recovery speed cap (default 3 m/s). Reduces visible sinking under stacks.
-    world_def.maxContactPushSpeed = 6.0f * b2GetLengthUnitsPerMeter();
+    world_def.maxContactPushSpeed = 10.0f * b2GetLengthUnitsPerMeter();
 
     g_world = b2CreateWorld(&world_def);
 
